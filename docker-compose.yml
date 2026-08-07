@@ -1,0 +1,41 @@
+# Pinned so the volume name stays `renderbin_db-data` no matter what
+# the checkout directory is called — without it, renaming or moving the repo
+# makes compose create a fresh empty volume and the app boots to first-run
+# setup with the old database orphaned.
+name: renderbin
+
+services:
+  app:
+    # Prebuilt multi-arch image (linux/amd64 + linux/arm64), so `docker compose
+    # up -d` pulls rather than compiling on your server. Pin a version if you'd
+    # rather upgrade deliberately: ghcr.io/shawn-bluce/renderbin:v0.1.0
+    #
+    # Deliberately no `build:` key here. With both `build` and `image`, compose
+    # *builds* when the image is missing locally instead of pulling, which would
+    # silently undo the whole point. To build the image yourself:
+    #   docker build -t renderbin:dev .
+    # For day-to-day development use `make dev-api` / `make dev-web` instead.
+    image: ghcr.io/shawn-bluce/renderbin:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      LISTEN_ADDR: ":8080"
+      DB_PATH: "/data/app.db"
+      # No admin credentials here: accounts live in the users table. On first
+      # run, open the app and create the super admin on the welcome page.
+    volumes:
+      # The whole directory, never just app.db — SQLite runs in WAL mode, and
+      # bind-mounting the single file would leave app.db-wal outside the mount.
+      - db-data:/data
+    # The server's own shutdown deadline is 10s; give docker a little more so
+    # a slow drain finishes instead of being SIGKILLed at the boundary.
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  db-data:

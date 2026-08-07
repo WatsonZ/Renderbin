@@ -1,0 +1,7 @@
+**/node_modules
+**/.svelte-kit
+web/build
+backend/bin
+backend/data
+backend/internal/web/dist/*
+.git

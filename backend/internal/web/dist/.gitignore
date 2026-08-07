@@ -1,0 +1,5 @@
+# Build output: `make build-web` fills this directory from web/build.
+# Nothing here is tracked -- this file alone is enough for //go:embed all:dist
+# to compile on a fresh clone (the SPA obviously doesn't work until you build).
+*
+!.gitignore

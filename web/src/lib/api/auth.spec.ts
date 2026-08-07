@@ -1,0 +1,93 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { AuthApiError, login, logout, me, register, setup } from './auth';
+
+function response(init: { ok: boolean; body?: unknown }): Response {
+	return {
+		ok: init.ok,
+		status: init.ok ? 200 : 401,
+		json: async () => init.body ?? {},
+		text: async () => JSON.stringify(init.body ?? {})
+	} as unknown as Response;
+}
+
+function mockFetch(res: Response) {
+	const fn = vi.fn().mockResolvedValue(res);
+	vi.stubGlobal('fetch', fn);
+	return fn;
+}
+
+afterEach(() => {
+	vi.unstubAllGlobals();
+});
+
+describe('auth api', () => {
+	it('login POSTs credentials and resolves on success', async () => {
+		const fetchMock = mockFetch(response({ ok: true }));
+		await expect(login('admin', 'pw')).resolves.toBeUndefined();
+		expect(fetchMock).toHaveBeenCalledWith(
+			'/api/auth/login',
+			expect.objectContaining({
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ username: 'admin', password: 'pw' })
+			})
+		);
+	});
+
+	it('login throws a fixed message on failure', async () => {
+		mockFetch(response({ ok: false }));
+		await expect(login('admin', 'wrong')).rejects.toThrow('Invalid username or password');
+	});
+
+	it('logout POSTs /api/auth/logout and always resolves', async () => {
+		const fetchMock = mockFetch(response({ ok: true }));
+		await expect(logout()).resolves.toBeUndefined();
+		expect(fetchMock).toHaveBeenCalledWith('/api/auth/logout', { method: 'POST' });
+	});
+
+	it('me returns the parsed body when authenticated', async () => {
+		mockFetch(response({ ok: true, body: { username: 'admin' } }));
+		await expect(me()).resolves.toEqual({ username: 'admin' });
+	});
+
+	it('me returns null when unauthenticated', async () => {
+		mockFetch(response({ ok: false }));
+		await expect(me()).resolves.toBeNull();
+	});
+
+	it('register POSTs the three fields and resolves on success', async () => {
+		const fetchMock = mockFetch(response({ ok: true }));
+		await expect(register('user', 'Nick', 'secret1')).resolves.toBeUndefined();
+		expect(fetchMock).toHaveBeenCalledWith(
+			'/api/auth/register',
+			expect.objectContaining({
+				method: 'POST',
+				body: JSON.stringify({ username: 'user', nickname: 'Nick', password: 'secret1' })
+			})
+		);
+	});
+
+	it('register throws an AuthApiError carrying the status on failure', async () => {
+		const res = response({ ok: false });
+		(res as { status: number }).status = 409;
+		mockFetch(res);
+		await expect(register('user', 'Nick', 'secret1')).rejects.toMatchObject({ status: 409 });
+		await expect(register('user', 'Nick', 'secret1')).rejects.toBeInstanceOf(AuthApiError);
+	});
+
+	it('setup POSTs the payload including config toggles', async () => {
+		const fetchMock = mockFetch(response({ ok: true }));
+		const payload = {
+			username: 'boss',
+			nickname: 'Boss',
+			password: 'secret1',
+			allow_registration: true,
+			mcp_enabled: false
+		};
+		await expect(setup(payload)).resolves.toBeUndefined();
+		expect(fetchMock).toHaveBeenCalledWith(
+			'/api/setup',
+			expect.objectContaining({ method: 'POST', body: JSON.stringify(payload) })
+		);
+	});
+});
