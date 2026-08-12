@@ -27,6 +27,22 @@ go.work.sum
 # env file
 .env
 
+# SQLite databases and their WAL sidecars. backend/.gitignore already covers
+# `make dev-api` (which runs from backend/), but the built binary defaults to
+# DB_PATH=data/app.db relative to wherever it is started -- so running it from
+# the repo root creates these here. An empty data/app.db was committed exactly
+# that way, and every local run then showed up as a modified tracked file.
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# macOS
+.DS_Store
+
+# Release workflow output (also produced by a local dry run of it)
+/dist/
+
 # Editor/IDE
 # .idea/
 # .vscode/

@@ -43,7 +43,7 @@ type MCPHandler struct {
 }
 
 // NewMCPHandler builds the /mcp http.Handler: body cap → mcp_enabled gate →
-// Bearer-token auth → streamable MCP server with the six file tools.
+// Bearer-token auth → streamable MCP server with the eight file tools.
 func NewMCPHandler(queries *sqlcgen.Queries, logger *slog.Logger) http.Handler {
 	m := &MCPHandler{queries: queries, logger: logger}
 
@@ -57,6 +57,10 @@ func NewMCPHandler(queries *sqlcgen.Queries, logger *slog.Logger) http.Handler {
 		Description: "Upload up to 20 Markdown or HTML documents in one call. Files start private; returns each file's URL.",
 	}, m.uploadFiles)
 	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "list_files",
+		Description: "List your own documents, newest first, with each one's slug, format, visibility and access URL. Use search_files instead when you know part of a name or its content.",
+	}, m.listFiles)
+	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "search_files",
 		Description: "Search your own documents by name and content. Returns each match's name and access URL.",
 	}, m.searchFiles)
@@ -66,8 +70,12 @@ func NewMCPHandler(queries *sqlcgen.Queries, logger *slog.Logger) http.Handler {
 	}, m.updateFile)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "publish_file",
-		Description: "Make a document publicly accessible and return its shareable URL.",
+		Description: "Make a document publicly accessible and return its shareable URL. Optionally give the link a lifetime: either ttl (a number plus a unit: 36h, 1d, 2w, 6mo, 1y) or max_views, never both. When the limit is reached the file goes private again by itself.",
 	}, m.publishFile)
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "unpublish_file",
+		Description: "Make a public document private again, so its URL stops working for everyone but you. The document itself is kept; use delete_file to remove it.",
+	}, m.unpublishFile)
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "delete_file",
 		Description: "Move a document to the trash. First call it without confirm: it returns the file's name and URL so you can ask the user to confirm. Only after the user explicitly confirms, call it again with confirm=true. Permanent deletion is not available over MCP.",
@@ -111,6 +119,11 @@ func (m *MCPHandler) verifyAPIKey(ctx context.Context, token string, r *http.Req
 	if err != nil {
 		return nil, err
 	}
+	// A suspended account's key is as dead as its password. Without this,
+	// suspension would close the browser door and leave the agent one open.
+	if user.DisabledAt.Valid {
+		return nil, mcpauth.ErrInvalidToken
+	}
 	return &mcpauth.TokenInfo{
 		UserID: strconv.FormatInt(user.ID, 10),
 		// API keys don't expire; this only satisfies the SDK's per-request
@@ -118,24 +131,6 @@ func (m *MCPHandler) verifyAPIKey(ctx context.Context, token string, r *http.Req
 		Expiration: time.Now().Add(time.Hour),
 		Extra:      map[string]any{"user": user, "baseURL": requestBaseURL(r)},
 	}, nil
-}
-
-// requestBaseURL derives the externally visible origin per request, so
-// returned URLs are correct without a configured base URL. Behind a reverse
-// proxy, X-Forwarded-Proto (and optionally X-Forwarded-Host) must be set.
-func requestBaseURL(r *http.Request) string {
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	if v := r.Header.Get("X-Forwarded-Proto"); v != "" {
-		scheme = v
-	}
-	host := r.Host
-	if v := r.Header.Get("X-Forwarded-Host"); v != "" {
-		host = v
-	}
-	return scheme + "://" + host
 }
 
 // mcpIdentity recovers the authenticated user and base URL stashed by
@@ -229,6 +224,21 @@ func (m *MCPHandler) createUpload(ctx context.Context, user sqlcgen.User, in mcp
 	if name == "" {
 		name = "Untitled"
 	}
+	// The same bound the HTTP path applies. Without it an agent could store a
+	// multi-kilobyte name that later turns every download of that file into a
+	// 502 from the reverse proxy, whose header buffer it overflows.
+	if len(name) > maxNameBytes {
+		return sqlcgen.File{}, fmt.Errorf("name must be at most %d bytes", maxNameBytes)
+	}
+	// Storage limits are per account, not per protocol: an API key that could
+	// ignore them would make users.quota_bytes decorative.
+	if err := enforceQuota(ctx, m.queries, user, int64(len(in.Content)), 0); err != nil {
+		if errors.Is(err, errOverQuota) {
+			return sqlcgen.File{}, err
+		}
+		m.logger.Error("mcp check quota", "user_id", user.ID, "error", err)
+		return sqlcgen.File{}, errors.New("internal error")
+	}
 
 	accessCode, err := auth.NewAccessCode()
 	if err != nil {
@@ -317,6 +327,76 @@ func (m *MCPHandler) uploadFiles(ctx context.Context, req *mcp.CallToolRequest, 
 	return textResult("%s", summary), out, nil
 }
 
+// --- list ---
+
+// mcpListLimit caps how many rows list_files returns. An agent's context is the
+// real constraint here, so the tool reports the true total alongside the
+// truncated list instead of pretending the cap is the whole story.
+const mcpListLimit = 200
+
+type listFilesInput struct{}
+
+type listFilesOutput struct {
+	Total     int           `json:"total" jsonschema:"how many documents you have in total"`
+	Truncated bool          `json:"truncated" jsonschema:"true when total exceeds the returned page"`
+	Files     []mcpFileInfo `json:"files"`
+}
+
+func (m *MCPHandler) listFiles(ctx context.Context, req *mcp.CallToolRequest, _ listFilesInput) (*mcp.CallToolResult, listFilesOutput, error) {
+	user, baseURL, err := mcpIdentity(req)
+	if err != nil {
+		return nil, listFilesOutput{}, err
+	}
+
+	rows, err := m.queries.ListUserFiles(ctx, user.ID)
+	if err != nil {
+		m.logger.Error("mcp list files", "error", err)
+		return nil, listFilesOutput{}, errors.New("internal error")
+	}
+	files := make([]sqlcgen.File, 0, len(rows))
+	for _, row := range rows {
+		files = append(files, listRowToFile(row))
+	}
+	if len(files) == 0 {
+		return textResult("This project has no documents yet. Use upload_file to add one."),
+			listFilesOutput{Files: []mcpFileInfo{}}, nil
+	}
+
+	out := listFilesOutput{Total: len(files), Truncated: len(files) > mcpListLimit}
+	if out.Truncated {
+		files = files[:mcpListLimit]
+	}
+	out.Files = make([]mcpFileInfo, 0, len(files))
+	var lines []string
+	for _, f := range files {
+		info := fileInfo(baseURL, f)
+		out.Files = append(out.Files, info)
+		lines = append(lines, fmt.Sprintf("- %q [%s, %s]: %s", info.Name, info.Kind, visibilityLabel(f), info.URL))
+	}
+
+	summary := fmt.Sprintf("%d document(s):\n%s", out.Total, strings.Join(lines, "\n"))
+	if out.Truncated {
+		summary += fmt.Sprintf("\n(showing the %d newest of %d; use search_files to narrow it down)", mcpListLimit, out.Total)
+	}
+	return textResult("%s", summary), out, nil
+}
+
+// visibilityLabel describes a file's shareability in the one sentence a tool
+// result has room for, including any self-expiring limit on the link.
+func visibilityLabel(f sqlcgen.File) string {
+	if !f.IsPublic {
+		return "private -- publish_file required before the URL works for others"
+	}
+	switch {
+	case f.ExpiresAt.Valid:
+		return "public until " + f.ExpiresAt.Time.UTC().Format(timeLayout)
+	case f.MaxViews.Valid:
+		return fmt.Sprintf("public for %d more view(s)", max(0, f.MaxViews.Int64-f.ViewCount))
+	default:
+		return "public"
+	}
+}
+
 // --- search ---
 
 type searchFilesInput struct {
@@ -343,7 +423,7 @@ func (m *MCPHandler) searchFiles(ctx context.Context, req *mcp.CallToolRequest, 
 		return nil, searchFilesOutput{}, errors.New("query is required")
 	}
 
-	files, err := m.queries.SearchUserFilesWithContent(ctx, sqlcgen.SearchUserFilesWithContentParams{
+	rows, err := m.queries.SearchUserFilesWithContent(ctx, sqlcgen.SearchUserFilesWithContentParams{
 		UserID:       user.ID,
 		NameQuery:    q,
 		ContentQuery: q,
@@ -353,27 +433,23 @@ func (m *MCPHandler) searchFiles(ctx context.Context, req *mcp.CallToolRequest, 
 		return nil, searchFilesOutput{}, errors.New("internal error")
 	}
 
-	if len(files) == 0 {
+	if len(rows) == 0 {
 		return textResult("No documents matching %q were found in this project.", q),
 			searchFilesOutput{Found: false, Results: []searchFilesMatch{}}, nil
 	}
 
-	out := searchFilesOutput{Found: true, Results: make([]searchFilesMatch, 0, len(files))}
+	out := searchFilesOutput{Found: true, Results: make([]searchFilesMatch, 0, len(rows))}
 	var lines []string
-	for _, f := range files {
+	for _, row := range rows {
+		f := contentSearchRowToFile(row)
 		match := searchFilesMatch{mcpFileInfo: fileInfo(baseURL, f)}
 		if !containsFold(f.Name, q) {
-			match.Snippet = contentSnippet(f.HtmlContent, q)
+			match.Snippet = snippetFromWindow(row.SnippetWindow, q, row.MatchPos, row.ContentChars)
 		}
 		out.Results = append(out.Results, match)
-
-		visibility := "public"
-		if !f.IsPublic {
-			visibility = "private — publish_file required before the URL works for others"
-		}
-		lines = append(lines, fmt.Sprintf("- %q (%s): %s", f.Name, visibility, match.URL))
+		lines = append(lines, fmt.Sprintf("- %q (%s): %s", f.Name, visibilityLabel(f), match.URL))
 	}
-	return textResult("Found %d document(s) matching %q:\n%s", len(files), q, strings.Join(lines, "\n")), out, nil
+	return textResult("Found %d document(s) matching %q:\n%s", len(rows), q, strings.Join(lines, "\n")), out, nil
 }
 
 // --- update ---
@@ -405,9 +481,21 @@ func (m *MCPHandler) updateFile(ctx context.Context, req *mcp.CallToolRequest, i
 	if in.Name != "" {
 		name = strings.TrimSpace(in.Name)
 	}
+	if len(name) > maxNameBytes {
+		return nil, mcpFileInfo{}, fmt.Errorf("name must be at most %d bytes", maxNameBytes)
+	}
 	content := file.HtmlContent
 	if in.Content != "" {
 		content = in.Content
+	}
+	// file.ContentSize is what this write replaces, so rewriting a document
+	// with one of the same size is not charged twice.
+	if err := enforceQuota(ctx, m.queries, user, int64(len(content)), file.ContentSize); err != nil {
+		if errors.Is(err, errOverQuota) {
+			return nil, mcpFileInfo{}, err
+		}
+		m.logger.Error("mcp check quota", "user_id", user.ID, "error", err)
+		return nil, mcpFileInfo{}, errors.New("internal error")
 	}
 	updated, err := m.queries.UpdateFile(ctx, sqlcgen.UpdateFileParams{
 		Name:        name,
@@ -430,9 +518,65 @@ func (m *MCPHandler) updateFile(ctx context.Context, req *mcp.CallToolRequest, i
 
 type publishFileInput struct {
 	Slug string `json:"slug" jsonschema:"the document's slug (the path segment of its URL)"`
+	// Pointers, so "field omitted" is distinguishable from "24h"/0 and the
+	// mutual-exclusion check below sees what the caller actually sent.
+	TTL      *string `json:"ttl,omitempty" jsonschema:"optional link lifetime as a number plus a unit - h, d, w, mo or y (e.g. 36h, 1d, 2w, 6mo, 1y), at most 10 years. Mutually exclusive with max_views"`
+	MaxViews *int64  `json:"max_views,omitempty" jsonschema:"optional number of anonymous views the link allows before going private. Mutually exclusive with ttl"`
 }
 
 func (m *MCPHandler) publishFile(ctx context.Context, req *mcp.CallToolRequest, in publishFileInput) (*mcp.CallToolResult, mcpFileInfo, error) {
+	user, baseURL, err := mcpIdentity(req)
+	if err != nil {
+		return nil, mcpFileInfo{}, err
+	}
+	// Validated before the lookup so a bad ttl can't publish the file anyway.
+	limit, errMsg := parseExpiryLimit(in.TTL, in.MaxViews)
+	if errMsg != "" {
+		return nil, mcpFileInfo{}, errors.New(errMsg)
+	}
+	file, err := m.ownedFile(ctx, user, in.Slug)
+	if err != nil {
+		return nil, mcpFileInfo{}, err
+	}
+
+	// SetFileExpiry publishes as part of setting a limit, so a limited publish
+	// is one statement rather than a visibility write followed by an expiry
+	// write that could leave the file public with no limit if the second failed.
+	var published sqlcgen.File
+	if limit.set {
+		published, err = m.queries.SetFileExpiry(ctx, sqlcgen.SetFileExpiryParams{
+			ExpiresAt: limit.expiresAt,
+			MaxViews:  limit.maxViews,
+			Slug:      file.Slug,
+			UserID:    user.ID,
+		})
+	} else {
+		published, err = m.queries.SetFileVisibility(ctx, sqlcgen.SetFileVisibilityParams{
+			IsPublic: true,
+			Slug:     file.Slug,
+			UserID:   user.ID,
+		})
+	}
+	if err != nil {
+		m.logger.Error("mcp publish file", "error", err)
+		return nil, mcpFileInfo{}, errors.New("internal error")
+	}
+
+	out := fileInfo(baseURL, published)
+	return textResult("Published %q (%s). Anyone with this URL can now view it: %s",
+		out.Name, visibilityLabel(published), out.URL), out, nil
+}
+
+// --- unpublish ---
+
+type unpublishFileInput struct {
+	Slug string `json:"slug" jsonschema:"the document's slug (the path segment of its URL)"`
+}
+
+// unpublishFile is publish_file's inverse: visibility only. Any expiry limit is
+// left alone, so re-publishing later resumes the same countdown rather than
+// silently handing out an unlimited link.
+func (m *MCPHandler) unpublishFile(ctx context.Context, req *mcp.CallToolRequest, in unpublishFileInput) (*mcp.CallToolResult, mcpFileInfo, error) {
 	user, baseURL, err := mcpIdentity(req)
 	if err != nil {
 		return nil, mcpFileInfo{}, err
@@ -442,18 +586,18 @@ func (m *MCPHandler) publishFile(ctx context.Context, req *mcp.CallToolRequest, 
 		return nil, mcpFileInfo{}, err
 	}
 
-	published, err := m.queries.SetFileVisibility(ctx, sqlcgen.SetFileVisibilityParams{
-		IsPublic: true,
+	updated, err := m.queries.SetFileVisibility(ctx, sqlcgen.SetFileVisibilityParams{
+		IsPublic: false,
 		Slug:     file.Slug,
 		UserID:   user.ID,
 	})
 	if err != nil {
-		m.logger.Error("mcp publish file", "error", err)
+		m.logger.Error("mcp unpublish file", "error", err)
 		return nil, mcpFileInfo{}, errors.New("internal error")
 	}
 
-	out := fileInfo(baseURL, published)
-	return textResult("Published %q. Anyone with this URL can now view it: %s", out.Name, out.URL), out, nil
+	out := fileInfo(baseURL, updated)
+	return textResult("Unpublished %q. Its URL now works only for you; the document itself is untouched.", out.Name), out, nil
 }
 
 // --- delete ---

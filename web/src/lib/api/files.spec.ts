@@ -4,6 +4,7 @@ import {
 	createFile,
 	deleteFile,
 	deleteFilePermanent,
+	emptyTrash,
 	getFile,
 	listFiles,
 	listTrashed,
@@ -172,6 +173,14 @@ describe('files api — request shapes', () => {
 		await expect(deleteFilePermanent('a')).resolves.toBeUndefined();
 		expect(fetchMock).toHaveBeenCalledWith('/api/files/a/permanent', { method: 'DELETE' });
 	});
+
+	// Deliberately not /api/files/trash: a static segment there would shadow a
+	// file whose custom slug is "trash", and this request deletes.
+	it('emptyTrash DELETEs /api/trash and returns the count', async () => {
+		const fetchMock = mockFetch(okJson({ deleted: 3 }));
+		await expect(emptyTrash()).resolves.toEqual({ deleted: 3 });
+		expect(fetchMock).toHaveBeenCalledWith('/api/trash', { method: 'DELETE' });
+	});
 });
 
 describe('files api — error handling', () => {
@@ -198,14 +207,14 @@ describe('searchFiles', () => {
 	it('GETs name-only search without the content flag', async () => {
 		const fetchMock = mockFetch(okJson([]));
 		await expect(searchFiles('hello', false)).resolves.toEqual([]);
-		expect(fetchMock).toHaveBeenCalledWith('/api/files/search?q=hello');
+		expect(fetchMock).toHaveBeenCalledWith('/api/search?q=hello');
 	});
 
 	it('adds content=true and encodes the query', async () => {
 		const results = [{ slug: 'a', matched_name: false, matched_content: true, snippet: '…hello…' }];
 		const fetchMock = mockFetch(okJson(results));
 		await expect(searchFiles('a b&c', true)).resolves.toEqual(results);
-		expect(fetchMock).toHaveBeenCalledWith('/api/files/search?q=a+b%26c&content=true');
+		expect(fetchMock).toHaveBeenCalledWith('/api/search?q=a+b%26c&content=true');
 	});
 
 	it('throws ApiError on failure', async () => {

@@ -8,7 +8,7 @@ services:
   app:
     # Prebuilt multi-arch image (linux/amd64 + linux/arm64), so `docker compose
     # up -d` pulls rather than compiling on your server. Pin a version if you'd
-    # rather upgrade deliberately: ghcr.io/shawn-bluce/renderbin:v0.1.0
+    # rather upgrade deliberately: ghcr.io/shawn-bluce/renderbin:0.2.0
     #
     # Deliberately no `build:` key here. With both `build` and `image`, compose
     # *builds* when the image is missing locally instead of pulling, which would

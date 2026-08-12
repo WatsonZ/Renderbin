@@ -28,9 +28,12 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) er
 
 const deleteExpiredSessions = `-- name: DeleteExpiredSessions :exec
 DELETE FROM sessions
-WHERE expires_at <= CURRENT_TIMESTAMP
+WHERE unixepoch(expires_at) IS NULL OR unixepoch(expires_at) <= unixepoch('now')
 `
 
+// The IS NULL arm sweeps rows whose expires_at unixepoch() cannot parse:
+// GetValidSession already treats them as expired, and without this they would
+// never be collected.
 func (q *Queries) DeleteExpiredSessions(ctx context.Context) error {
 	_, err := q.db.ExecContext(ctx, deleteExpiredSessions)
 	return err
@@ -46,11 +49,30 @@ func (q *Queries) DeleteSession(ctx context.Context, token string) error {
 	return err
 }
 
-const getValidSession = `-- name: GetValidSession :one
-SELECT token, created_at, expires_at, user_id FROM sessions
-WHERE token = ? AND expires_at > CURRENT_TIMESTAMP
+const deleteUserSessions = `-- name: DeleteUserSessions :exec
+DELETE FROM sessions
+WHERE user_id = ?
 `
 
+// Every session of one user, for the privileged actions that must end a
+// suspended or password-reset account's access right now rather than whenever
+// its cookies happen to expire.
+func (q *Queries) DeleteUserSessions(ctx context.Context, userID int64) error {
+	_, err := q.db.ExecContext(ctx, deleteUserSessions, userID)
+	return err
+}
+
+const getValidSession = `-- name: GetValidSession :one
+SELECT token, created_at, expires_at, user_id FROM sessions
+WHERE token = ? AND unixepoch(expires_at) > unixepoch('now')
+`
+
+// Expiry is compared through unixepoch() rather than as text: this column holds
+// an ISO-8601 UTC string written by the driver, CURRENT_TIMESTAMP produces a
+// bare 'YYYY-MM-DD HH:MM:SS', and a plain '>' between the two would be a
+// lexicographic comparison of two different shapes. unixepoch() reduces both to
+// an instant. A value it cannot parse yields NULL, so such a row is never valid
+// -- the fail-closed direction.
 func (q *Queries) GetValidSession(ctx context.Context, token string) (Session, error) {
 	row := q.db.QueryRowContext(ctx, getValidSession, token)
 	var i Session

@@ -2,8 +2,11 @@
 	import { resolve } from '$app/paths';
 	import Icon from '@iconify/svelte';
 	import { t } from '$lib/i18n/index.svelte';
+	import { copyText } from '$lib/clipboard';
 	import LanguageSwitcher from '$lib/components/LanguageSwitcher.svelte';
 	import Toggle from '$lib/components/Toggle.svelte';
+	import AccountsSection from './AccountsSection.svelte';
+	import BackupSection from './BackupSection.svelte';
 	import { AuthApiError } from '$lib/api/auth';
 	import { ensureApiKey, resetApiKey, updateProfile, updateSettings } from '$lib/api/settings';
 	import { changePasswordSchema } from '$lib/schemas/register';
@@ -51,8 +54,12 @@
 
 	async function copySetupPrompt() {
 		if (!setupPrompt) return;
-		await navigator.clipboard.writeText(setupPrompt);
-		promptCopied = true;
+		// copyText falls back to execCommand and reports failure rather than
+		// throwing: navigator.clipboard does not exist over plain HTTP, which
+		// is a supported way to run this app, and an unguarded call there made
+		// the button do nothing at all with no error.
+		promptCopied = await copyText(setupPrompt);
+		if (!promptCopied) return;
 		clearTimeout(promptCopiedTimeout);
 		promptCopiedTimeout = setTimeout(() => (promptCopied = false), 1500);
 	}
@@ -136,8 +143,8 @@
 
 	async function copyApiKey() {
 		if (!apiKey) return;
-		await navigator.clipboard.writeText(apiKey);
-		apiKeyCopied = true;
+		apiKeyCopied = await copyText(apiKey);
+		if (!apiKeyCopied) return;
 		clearTimeout(copiedTimeout);
 		copiedTimeout = setTimeout(() => (apiKeyCopied = false), 1500);
 	}
@@ -266,6 +273,17 @@
 				</div>
 			</div>
 		</section>
+
+		<!-- Sections: accounts and backup/restore. Both are rendered only for the
+		     super admin, unlike the config toggles below, which everyone sees
+		     (disabled) since knowing the instance's policy is useful. `users` is
+		     null for anyone else, so this can't render a list it doesn't have. -->
+		{#if isAdmin && data.users}
+			<AccountsSection users={data.users} />
+		{/if}
+		{#if isAdmin}
+			<BackupSection />
+		{/if}
 
 		<!-- Section: registration -->
 		<section class="rounded-2xl border border-neutral-800 bg-neutral-900/60 p-6">

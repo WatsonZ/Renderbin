@@ -14,8 +14,22 @@ var migrationsFS embed.FS
 
 // Open opens the SQLite database at path, enables WAL mode, and applies
 // any pending migrations from internal/db/migrations in filename order.
+//
+// The two time DSN parameters are load-bearing, not tuning. The driver's
+// default write format is Go's time.Time.String() -- local wall clock with the
+// monotonic clock reading appended ("... +0800 CST m=+2592020.55") -- which
+// nothing else in the database speaks, since CURRENT_TIMESTAMP writes
+// 'YYYY-MM-DD HH:MM:SS' in UTC. _time_format=sqlite switches writes to
+// ISO-8601, and _timezone=UTC makes both directions UTC: written times are
+// converted before formatting, and a stored value without an offset (every
+// CURRENT_TIMESTAMP column) is read back as UTC rather than as local time.
+// Together they make every timestamp column one comparable format. Migration
+// 0002 rewrote the rows an earlier build had already stored the old way.
+//
+// LoadLocation("UTC") is resolved by the standard library itself, so this adds
+// no tzdata dependency to the scratch-built binary.
 func Open(path string) (*sql.DB, error) {
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)", path)
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_time_format=sqlite&_timezone=UTC", path)
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)

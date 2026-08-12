@@ -5,13 +5,13 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -23,12 +23,31 @@ import (
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
 )
 
-// maxHTMLBytes caps stored HTML at 5 MB per file; bodyOverhead leaves room for
-// the surrounding JSON envelope (name/slug fields) in the request body guard.
+// maxHTMLBytes caps stored HTML at 5 MB per file. maxFileBody is the cap on the
+// raw request body carrying it.
+//
+// maxFileBody is deliberately far above maxHTMLBytes rather than "5MB plus a
+// little". The body is JSON, and JSON escaping costs an extra byte for every
+// quote, backslash, tab and newline in the document -- a 5MB HTML file has well
+// over a hundred thousand of those. The cap used to be maxHTMLBytes+64KB, so a
+// legal 5MB document tripped the reader before the decoder ever ran and the
+// user got 400 "invalid request body" for a file that was within the advertised
+// limit. Leaving room for a 2x expansion means the explicit length check below
+// is what rejects an oversized document, with a message that says so.
 const (
 	maxHTMLBytes = 5 << 20
-	bodyOverhead = 64 << 10
+	maxFileBody  = 2*maxHTMLBytes + 64<<10
 )
+
+// maxNameBytes bounds a file's display name. It is not cosmetic: the name goes
+// into the Content-Disposition header of every download, and a name longer than
+// the reverse proxy's header buffer (Nginx defaults to 4-8KB) turns that
+// download into a 502 with nothing in the app's own logs to explain it.
+const maxNameBytes = 255
+
+// maxTagsBytes bounds the raw comma-separated tag string before normalizeTags
+// splits it, which it does into one intermediate string per comma.
+const maxTagsBytes = 1024
 
 // slugPattern restricts custom slugs to URL-safe characters so they can be
 // dropped into /res/{slug} without escaping.
@@ -80,10 +99,14 @@ func NewFilesHandler(queries *sqlcgen.Queries, logger *slog.Logger) *FilesHandle
 }
 
 type fileResponse struct {
-	Slug             string  `json:"slug"`
-	Name             string  `json:"name"`
-	Kind             string  `json:"kind"`
-	HTMLContent      string  `json:"html_content,omitempty"`
+	Slug        string `json:"slug"`
+	Name        string `json:"name"`
+	Kind        string `json:"kind"`
+	HTMLContent string `json:"html_content,omitempty"`
+	// Size is the stored source's length in bytes. The listings read it from
+	// the files.content_size column; the single-file endpoints, which hold the
+	// content anyway, measure it directly.
+	Size             int64   `json:"size"`
 	IsPublic         bool    `json:"is_public"`
 	AccessCode       string  `json:"access_code"`
 	Tags             string  `json:"tags"`
@@ -95,6 +118,11 @@ type fileResponse struct {
 	ExpiresAt        *string `json:"expires_at"`
 	MaxViews         *int64  `json:"max_views"`
 	ViewCount        int64   `json:"view_count"`
+	// The last time a limit took this file offline, and which limit it was
+	// (ExpiryReasonTTL / ExpiryReasonViews). Only the most recent event is
+	// kept, and configuring a new limit clears both.
+	ExpiredAt     *string `json:"expired_at"`
+	ExpiredReason string  `json:"expired_reason"`
 }
 
 const timeLayout = "2006-01-02T15:04:05Z07:00"
@@ -105,6 +133,7 @@ func toFileResponse(f sqlcgen.File) fileResponse {
 		Name:             f.Name,
 		Kind:             f.Kind,
 		HTMLContent:      f.HtmlContent,
+		Size:             int64(len(f.HtmlContent)),
 		IsPublic:         f.IsPublic,
 		AccessCode:       f.AccessCode,
 		Tags:             f.Tags,
@@ -114,6 +143,7 @@ func toFileResponse(f sqlcgen.File) fileResponse {
 		CodeSuccessCount: f.CodeSuccessCount,
 		FailureCount:     f.FailureCount,
 		ViewCount:        f.ViewCount,
+		ExpiredReason:    f.ExpiredReason,
 	}
 	if f.ExpiresAt.Valid {
 		s := f.ExpiresAt.Time.Format(timeLayout)
@@ -122,6 +152,10 @@ func toFileResponse(f sqlcgen.File) fileResponse {
 	if f.MaxViews.Valid {
 		v := f.MaxViews.Int64
 		resp.MaxViews = &v
+	}
+	if f.ExpiredAt.Valid {
+		s := f.ExpiredAt.Time.Format(timeLayout)
+		resp.ExpiredAt = &s
 	}
 	return resp
 }
@@ -145,36 +179,105 @@ func normalizeTags(raw string) string {
 	return strings.Join(tags, ",")
 }
 
+// The listing and search queries deliberately don't select html_content (see
+// queries/files.sql), so sqlc emits a distinct row struct for each of them
+// instead of the shared File model. These four converters funnel those rows
+// back into one File with an empty HtmlContent, so toFileResponse stays the
+// single place that formats a file for the wire.
+//
+// They are struct literals with named fields, so adding a column to the
+// listings compiles fine here and is silently zeroed -- the same gap this
+// codebase already accepts for sqlc's ...Params structs. Add the field to all
+// four when you add a column.
+func listRowToFile(r sqlcgen.ListUserFilesRow) sqlcgen.File {
+	return sqlcgen.File{
+		ID: r.ID, Slug: r.Slug, Name: r.Name, IsPublic: r.IsPublic,
+		AccessCode: r.AccessCode, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+		DeletedAt: r.DeletedAt, SuccessCount: r.SuccessCount, FailureCount: r.FailureCount,
+		Tags: r.Tags, ExpiresAt: r.ExpiresAt, MaxViews: r.MaxViews, ViewCount: r.ViewCount,
+		Kind: r.Kind, CodeSuccessCount: r.CodeSuccessCount, UserID: r.UserID,
+		ExpiredAt: r.ExpiredAt, ExpiredReason: r.ExpiredReason, ContentSize: r.ContentSize,
+	}
+}
+
+func deletedRowToFile(r sqlcgen.ListUserDeletedFilesRow) sqlcgen.File {
+	return sqlcgen.File{
+		ID: r.ID, Slug: r.Slug, Name: r.Name, IsPublic: r.IsPublic,
+		AccessCode: r.AccessCode, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+		DeletedAt: r.DeletedAt, SuccessCount: r.SuccessCount, FailureCount: r.FailureCount,
+		Tags: r.Tags, ExpiresAt: r.ExpiresAt, MaxViews: r.MaxViews, ViewCount: r.ViewCount,
+		Kind: r.Kind, CodeSuccessCount: r.CodeSuccessCount, UserID: r.UserID,
+		ExpiredAt: r.ExpiredAt, ExpiredReason: r.ExpiredReason, ContentSize: r.ContentSize,
+	}
+}
+
+func nameSearchRowToFile(r sqlcgen.SearchUserFilesByNameRow) sqlcgen.File {
+	return sqlcgen.File{
+		ID: r.ID, Slug: r.Slug, Name: r.Name, IsPublic: r.IsPublic,
+		AccessCode: r.AccessCode, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+		DeletedAt: r.DeletedAt, SuccessCount: r.SuccessCount, FailureCount: r.FailureCount,
+		Tags: r.Tags, ExpiresAt: r.ExpiresAt, MaxViews: r.MaxViews, ViewCount: r.ViewCount,
+		Kind: r.Kind, CodeSuccessCount: r.CodeSuccessCount, UserID: r.UserID,
+		ExpiredAt: r.ExpiredAt, ExpiredReason: r.ExpiredReason, ContentSize: r.ContentSize,
+	}
+}
+
+func contentSearchRowToFile(r sqlcgen.SearchUserFilesWithContentRow) sqlcgen.File {
+	return sqlcgen.File{
+		ID: r.ID, Slug: r.Slug, Name: r.Name, IsPublic: r.IsPublic,
+		AccessCode: r.AccessCode, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+		DeletedAt: r.DeletedAt, SuccessCount: r.SuccessCount, FailureCount: r.FailureCount,
+		Tags: r.Tags, ExpiresAt: r.ExpiresAt, MaxViews: r.MaxViews, ViewCount: r.ViewCount,
+		Kind: r.Kind, CodeSuccessCount: r.CodeSuccessCount, UserID: r.UserID,
+		ExpiredAt: r.ExpiredAt, ExpiredReason: r.ExpiredReason, ContentSize: r.ContentSize,
+	}
+}
+
+// listResponse formats a listing row: the stored size comes from the
+// content_size column, since these rows carry no content to measure.
+func listResponse(f sqlcgen.File) fileResponse {
+	item := toFileResponse(f)
+	item.Size = f.ContentSize
+	return item
+}
+
 func (h *FilesHandler) List(w http.ResponseWriter, r *http.Request) {
 	user, ok := requireUser(w, r)
 	if !ok {
 		return
 	}
 
-	var (
-		files []sqlcgen.File
-		err   error
-	)
+	var files []sqlcgen.File
 	if r.URL.Query().Get("deleted") == "true" {
-		files, err = h.queries.ListUserDeletedFiles(r.Context(), user.ID)
+		rows, err := h.queries.ListUserDeletedFiles(r.Context(), user.ID)
+		if err != nil {
+			h.logger.Error("list deleted files", "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		files = make([]sqlcgen.File, 0, len(rows))
+		for _, row := range rows {
+			files = append(files, deletedRowToFile(row))
+		}
 	} else {
-		files, err = h.queries.ListUserFiles(r.Context(), user.ID)
-	}
-	if err != nil {
-		h.logger.Error("list files", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+		rows, err := h.queries.ListUserFiles(r.Context(), user.ID)
+		if err != nil {
+			h.logger.Error("list files", "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		files = make([]sqlcgen.File, 0, len(rows))
+		for _, row := range rows {
+			files = append(files, listRowToFile(row))
+		}
 	}
 
 	resp := make([]fileResponse, 0, len(files))
 	for _, f := range files {
-		item := toFileResponse(f)
-		item.HTMLContent = ""
-		resp = append(resp, item)
+		resp = append(resp, listResponse(f))
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, resp)
 }
 
 // searchResultResponse augments the list-row fields with where the query
@@ -187,7 +290,7 @@ type searchResultResponse struct {
 	Snippet        string `json:"snippet,omitempty"`
 }
 
-// Search implements GET /api/files/search?q=...&content=true — substring
+// Search implements GET /api/search?q=...&content=true — substring
 // search scoped to the current user's own (non-deleted) files. Name-only by
 // default; content=true also searches the stored source.
 func (h *FilesHandler) Search(w http.ResponseWriter, r *http.Request) {
@@ -198,45 +301,55 @@ func (h *FilesHandler) Search(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	includeContent := r.URL.Query().Get("content") == "true"
 
-	var (
-		files []sqlcgen.File
-		err   error
-	)
+	resp := make([]searchResultResponse, 0)
 	switch {
 	case q == "":
-		// Nothing to search; fall through with no rows.
+		// Nothing to search; answer with no rows.
 	case includeContent:
-		files, err = h.queries.SearchUserFilesWithContent(r.Context(), sqlcgen.SearchUserFilesWithContentParams{
+		rows, err := h.queries.SearchUserFilesWithContent(r.Context(), sqlcgen.SearchUserFilesWithContentParams{
 			UserID:       user.ID,
 			NameQuery:    q,
 			ContentQuery: q,
 		})
+		if err != nil {
+			h.logger.Error("search files", "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		for _, row := range rows {
+			res := searchResultResponse{
+				fileResponse:   listResponse(contentSearchRowToFile(row)),
+				MatchedName:    containsFold(row.Name, q),
+				MatchedContent: row.MatchPos > 0,
+			}
+			// A title hit renders as a plain row, so only a content-*only* hit
+			// carries a snippet -- but matched_content above reports the truth
+			// either way, since a consumer other than the dashboard has no
+			// reason to read it as "matched content and nothing else".
+			if !res.MatchedName {
+				res.Snippet = snippetFromWindow(row.SnippetWindow, q, row.MatchPos, row.ContentChars)
+			}
+			resp = append(resp, res)
+		}
 	default:
-		files, err = h.queries.SearchUserFilesByName(r.Context(), sqlcgen.SearchUserFilesByNameParams{
+		rows, err := h.queries.SearchUserFilesByName(r.Context(), sqlcgen.SearchUserFilesByNameParams{
 			UserID:    user.ID,
 			NameQuery: q,
 		})
-	}
-	if err != nil {
-		h.logger.Error("search files", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
+		if err != nil {
+			h.logger.Error("search files", "error", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		for _, row := range rows {
+			resp = append(resp, searchResultResponse{
+				fileResponse: listResponse(nameSearchRowToFile(row)),
+				MatchedName:  true,
+			})
+		}
 	}
 
-	resp := make([]searchResultResponse, 0, len(files))
-	for _, f := range files {
-		item := toFileResponse(f)
-		item.HTMLContent = ""
-		res := searchResultResponse{fileResponse: item, MatchedName: containsFold(f.Name, q)}
-		// A title hit renders as a plain row; only content-only hits carry a snippet.
-		if !res.MatchedName && includeContent {
-			res.Snippet = contentSnippet(f.HtmlContent, q)
-			res.MatchedContent = res.Snippet != ""
-		}
-		resp = append(resp, res)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, resp)
 }
 
 // containsFold reports whether s contains substr case-insensitively (full
@@ -249,49 +362,41 @@ func containsFold(s, substr string) bool {
 // content match in search results.
 const snippetRadius = 100
 
-// contentSnippet returns the text around the first case-insensitive
-// occurrence of query in content: the match plus up to snippetRadius runes on
-// each side, with ellipses marking truncation. Empty when there's no match.
-func contentSnippet(content, query string) string {
-	idx := strings.Index(strings.ToLower(content), strings.ToLower(query))
-	if idx < 0 {
+// snippetFromWindow turns the bounded window SearchUserFilesWithContent
+// extracts around a match into the excerpt the dashboard shows: the match plus
+// up to snippetRadius runes either side, with an ellipsis on each end that was
+// truncated.
+//
+// The window comes from SQL rather than the whole document on purpose -- see
+// the query -- so this never sees the file's full source and cannot be given a
+// 5MB string to slice. It receives the window, the 1-based character offset of
+// the match within the *document* (0 when the content did not match at all),
+// and the document's length in characters, which together are everything
+// needed to decide about ellipses.
+//
+// The window already starts at the right place (SQL clips it to 100 characters
+// before the match), so only its tail may need trimming: when the match sits
+// near the start of the document the "before" part is short and SQL's
+// fixed-length window runs further past the match than snippetRadius allows.
+func snippetFromWindow(window, query string, matchPos, contentChars int64) string {
+	if matchPos <= 0 || window == "" {
 		return ""
 	}
-	// ToLower can shift byte offsets for a few exotic characters; clamp to a
-	// rune boundary in the original string so slicing stays valid UTF-8.
-	if idx > len(content) {
-		idx = len(content)
-	}
-	for idx > 0 && !utf8.RuneStart(content[idx]) {
-		idx--
+
+	start := max(int64(1), matchPos-snippetRadius) // 1-based, in characters
+	runes := []rune(window)
+	// Characters of the window we keep: everything up to snippetRadius past
+	// the end of the match.
+	keep := (matchPos - start) + int64(utf8.RuneCountInString(query)) + snippetRadius
+	if keep < int64(len(runes)) {
+		runes = runes[:keep]
 	}
 
-	start := idx
-	for range snippetRadius {
-		if start == 0 {
-			break
-		}
-		_, size := utf8.DecodeLastRuneInString(content[:start])
-		start -= size
-	}
-
-	end := min(idx+len(query), len(content))
-	for end < len(content) && !utf8.RuneStart(content[end]) {
-		end++
-	}
-	for range snippetRadius {
-		if end == len(content) {
-			break
-		}
-		_, size := utf8.DecodeRuneInString(content[end:])
-		end += size
-	}
-
-	snippet := content[start:end]
-	if start > 0 {
+	snippet := string(runes)
+	if start > 1 {
 		snippet = "…" + snippet
 	}
-	if end < len(content) {
+	if start-1+int64(len(runes)) < contentChars {
 		snippet += "…"
 	}
 	return snippet
@@ -303,19 +408,93 @@ type createFileRequest struct {
 	HTMLContent string `json:"html_content"`
 }
 
-func (h *FilesHandler) Create(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxHTMLBytes+bodyOverhead)
-	var req createFileRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
-	}
-	if req.HTMLContent == "" {
+// validateContent applies the two rules every stored document has to satisfy.
+// Returns false after writing the response.
+func validateContent(w http.ResponseWriter, content string) bool {
+	if content == "" {
 		http.Error(w, "html_content is required", http.StatusBadRequest)
+		return false
+	}
+	if len(content) > maxHTMLBytes {
+		http.Error(w, "html_content exceeds 5MB", http.StatusRequestEntityTooLarge)
+		return false
+	}
+	return true
+}
+
+// normalizeName trims a display name, defaults it, and enforces maxNameBytes.
+// Returns false after writing the response.
+func normalizeName(w http.ResponseWriter, name string) (string, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "Untitled"
+	}
+	if len(name) > maxNameBytes {
+		http.Error(w, fmt.Sprintf("name must be at most %d bytes", maxNameBytes), http.StatusBadRequest)
+		return "", false
+	}
+	return name, true
+}
+
+// errOverQuota is what a caller shows when a write would exceed the owner's
+// storage limit. It is a sentinel so the HTTP layer can map it to 413 while the
+// MCP layer passes the message straight through as a tool error.
+var errOverQuota = errors.New("storage quota exceeded")
+
+// enforceQuota reports an error when storing newSize bytes would push the
+// account past its quota, given that replacing bytes of theirs are about to be
+// freed (0 on upload, the old document's size on an edit).
+//
+// **Every path that stores content must call this**, not just the HTTP one.
+// `users.quota_bytes` is worth nothing if one way in ignores it, and MCP is a
+// way in: an API key could upload 20 files of 5MB per call, without limit,
+// while the dashboard's own uploads were being refused.
+//
+// The sum comes from the content_size column, so this costs an indexed
+// aggregate rather than a read of every document the account owns. It is a
+// check-then-write, so two simultaneous uploads can both pass and overshoot by
+// one file; that is an accepted rounding error on a limit whose purpose is to
+// stop a runaway account, not to bill anyone.
+func enforceQuota(ctx context.Context, queries *sqlcgen.Queries, user sqlcgen.User, newSize, replacing int64) error {
+	used, err := queries.SumUserContentSize(ctx, user.ID)
+	if err != nil {
+		return fmt.Errorf("sum user content size: %w", err)
+	}
+	if used-replacing+newSize > user.QuotaBytes {
+		return fmt.Errorf("%w: this account may store %d bytes and is using %d",
+			errOverQuota, user.QuotaBytes, used)
+	}
+	return nil
+}
+
+// checkQuota is enforceQuota for an HTTP handler: it writes the response and
+// reports whether the caller should continue.
+func (h *FilesHandler) checkQuota(w http.ResponseWriter, r *http.Request, user sqlcgen.User, newSize, replacing int64) bool {
+	err := enforceQuota(r.Context(), h.queries, user, newSize, replacing)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, errOverQuota):
+		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+	default:
+		h.logger.Error("check quota", "user_id", user.ID, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}
+	return false
+}
+
+func (h *FilesHandler) Create(w http.ResponseWriter, r *http.Request) {
+	// requireAuth resolved the session; the file is attributed to its uploader.
+	user, ok := requireUser(w, r)
+	if !ok {
 		return
 	}
-	if len(req.HTMLContent) > maxHTMLBytes {
-		http.Error(w, "html_content exceeds 5MB", http.StatusRequestEntityTooLarge)
+
+	var req createFileRequest
+	if !decodeJSON(w, r, &req, maxFileBody) {
+		return
+	}
+	if !validateContent(w, req.HTMLContent) {
 		return
 	}
 	kind, ok := normalizeKind(req.Kind)
@@ -323,13 +502,12 @@ func (h *FilesHandler) Create(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "kind must be one of html, markdown, txt", http.StatusBadRequest)
 		return
 	}
-	if req.Name == "" {
-		req.Name = "Untitled"
-	}
-
-	// requireAuth resolved the session; the file is attributed to its uploader.
-	user, ok := requireUser(w, r)
+	name, ok := normalizeName(w, req.Name)
 	if !ok {
+		return
+	}
+	req.Name = name
+	if !h.checkQuota(w, r, user, int64(len(req.HTMLContent)), 0) {
 		return
 	}
 
@@ -358,11 +536,9 @@ func (h *FilesHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
 	item := toFileResponse(file)
 	item.HTMLContent = ""
-	json.NewEncoder(w).Encode(item)
+	writeJSONStatus(w, http.StatusCreated, item)
 }
 
 // Get returns a single file including its html_content, at GET
@@ -390,8 +566,7 @@ func (h *FilesHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(toFileResponse(file))
+	writeJSON(w, toFileResponse(file))
 }
 
 type updateFileRequest struct {
@@ -411,18 +586,11 @@ func (h *FilesHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 	oldSlug := chi.URLParam(r, "slug")
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxHTMLBytes+bodyOverhead)
 	var req updateFileRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	if !decodeJSON(w, r, &req, maxFileBody) {
 		return
 	}
-	if req.HTMLContent == "" {
-		http.Error(w, "html_content is required", http.StatusBadRequest)
-		return
-	}
-	if len(req.HTMLContent) > maxHTMLBytes {
-		http.Error(w, "html_content exceeds 5MB", http.StatusRequestEntityTooLarge)
+	if !validateContent(w, req.HTMLContent) {
 		return
 	}
 	req.Slug = strings.TrimSpace(req.Slug)
@@ -438,8 +606,30 @@ func (h *FilesHandler) Update(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "access_code must be 1-128 chars of letters, digits, '.', '_' or '-'", http.StatusBadRequest)
 		return
 	}
-	if req.Name == "" {
-		req.Name = "Untitled"
+	name, ok := normalizeName(w, req.Name)
+	if !ok {
+		return
+	}
+	req.Name = name
+
+	// What this edit replaces, so an in-place edit isn't charged twice against
+	// the quota. A slug that matches nothing 404s here rather than after the
+	// quota check, which keeps a missing file from being reported as a full one.
+	oldSize, err := h.queries.GetUserFileSize(r.Context(), sqlcgen.GetUserFileSizeParams{
+		Slug:   oldSlug,
+		UserID: user.ID,
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		h.logger.Error("get file size", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !h.checkQuota(w, r, user, int64(len(req.HTMLContent)), oldSize) {
+		return
 	}
 
 	file, err := h.queries.UpdateFile(r.Context(), sqlcgen.UpdateFileParams{
@@ -464,10 +654,9 @@ func (h *FilesHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	item := toFileResponse(file)
 	item.HTMLContent = ""
-	json.NewEncoder(w).Encode(item)
+	writeJSON(w, item)
 }
 
 // Restore un-deletes a soft-deleted file at POST /api/files/{slug}/restore.
@@ -492,19 +681,100 @@ func (h *FilesHandler) Restore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	item := toFileResponse(file)
 	item.HTMLContent = ""
-	json.NewEncoder(w).Encode(item)
+	writeJSON(w, item)
 }
 
-// ttlDurations is the allowed set of expiry presets for SetExpiry.
-var ttlDurations = map[string]time.Duration{
-	"24h": 24 * time.Hour,
-	"48h": 48 * time.Hour,
-	"72h": 72 * time.Hour,
-	"7d":  7 * 24 * time.Hour,
-	"30d": 30 * 24 * time.Hour,
+// A ttl is "<positive integer><unit>", e.g. 1d, 36h, 2w, 6mo, 1y — the same
+// vocabulary for the HTTP SetExpiry handler and the MCP publish_file tool. It
+// used to be a fixed preset set (24h/48h/72h/7d/30d); those all still parse
+// under this grammar, so nothing that spoke the old vocabulary broke.
+var ttlPattern = regexp.MustCompile(`^([0-9]{1,6})(h|d|w|mo|y)$`)
+
+// ttlSyntax is the syntax half of the ttl error message, spelled out once.
+const ttlSyntax = "ttl must be a positive whole number followed by h, d, w, mo or y (e.g. 1d, 36h, 2w, 6mo, 1y)"
+
+// maxTTLYears bounds how far ahead a link may be scheduled to expire. It is a
+// sanity cap, not a product limit: without one, "999999y" overflows time.Time
+// into a deadline in the past, i.e. a link that is born expired.
+const maxTTLYears = 10
+
+// ttlDeadline turns a ttl spec into the instant the link should stop working,
+// measured from now. Hours, days and weeks are fixed spans; months and years
+// step the calendar, so "1mo" lands on the same day of the next month rather
+// than 30 days out. Returns a client-facing message when the spec is unusable.
+func ttlDeadline(spec string, now time.Time) (time.Time, string) {
+	m := ttlPattern.FindStringSubmatch(spec)
+	if m == nil {
+		return time.Time{}, ttlSyntax
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n <= 0 {
+		return time.Time{}, ttlSyntax
+	}
+
+	var deadline time.Time
+	switch m[2] {
+	case "h":
+		deadline = now.Add(time.Duration(n) * time.Hour)
+	case "d":
+		deadline = now.AddDate(0, 0, n)
+	case "w":
+		deadline = now.AddDate(0, 0, 7*n)
+	case "mo":
+		deadline = now.AddDate(0, n, 0)
+	case "y":
+		deadline = now.AddDate(n, 0, 0)
+	}
+	if deadline.After(now.AddDate(maxTTLYears, 0, 0)) {
+		return time.Time{}, fmt.Sprintf("ttl must not exceed %d years", maxTTLYears)
+	}
+	return deadline, ""
+}
+
+// Why a file was last taken offline, stored in files.expired_reason.
+const (
+	ExpiryReasonTTL   = "ttl"   // the time window passed
+	ExpiryReasonViews = "views" // the view quota ran out
+)
+
+// expiryLimit is a validated expiry setting: exactly one of a deadline or a
+// view quota, or neither. Both the HTTP handler and the MCP tool build one of
+// these, so the "mutually exclusive" rule is stated once.
+type expiryLimit struct {
+	expiresAt sql.NullTime
+	maxViews  sql.NullInt64
+	set       bool // false means "no limit", i.e. clear whatever was there
+}
+
+// parseExpiryLimit validates a ttl spec and/or a max-view count. It returns a
+// client-facing message for invalid input; nil ttl and nil maxViews mean "no
+// limit", which is a valid request rather than an error.
+func parseExpiryLimit(ttl *string, maxViews *int64) (expiryLimit, string) {
+	switch {
+	case ttl != nil && maxViews != nil:
+		return expiryLimit{}, "ttl and max_views are mutually exclusive"
+	case ttl != nil:
+		deadline, errMsg := ttlDeadline(*ttl, time.Now())
+		if errMsg != "" {
+			return expiryLimit{}, errMsg
+		}
+		return expiryLimit{
+			expiresAt: sql.NullTime{Time: deadline, Valid: true},
+			set:       true,
+		}, ""
+	case maxViews != nil:
+		if *maxViews <= 0 {
+			return expiryLimit{}, "max_views must be positive"
+		}
+		return expiryLimit{
+			maxViews: sql.NullInt64{Int64: *maxViews, Valid: true},
+			set:      true,
+		}, ""
+	default:
+		return expiryLimit{}, ""
+	}
 }
 
 type setExpiryRequest struct {
@@ -524,12 +794,12 @@ func (h *FilesHandler) SetExpiry(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 
 	var req setExpiryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	if !decodeSmallJSON(w, r, &req) {
 		return
 	}
-	if req.TTL != nil && req.MaxViews != nil {
-		http.Error(w, "ttl and max_views are mutually exclusive", http.StatusBadRequest)
+	limit, errMsg := parseExpiryLimit(req.TTL, req.MaxViews)
+	if errMsg != "" {
+		http.Error(w, errMsg, http.StatusBadRequest)
 		return
 	}
 
@@ -537,29 +807,14 @@ func (h *FilesHandler) SetExpiry(w http.ResponseWriter, r *http.Request) {
 		file sqlcgen.File
 		err  error
 	)
-	switch {
-	case req.TTL != nil:
-		dur, ok := ttlDurations[*req.TTL]
-		if !ok {
-			http.Error(w, "invalid ttl", http.StatusBadRequest)
-			return
-		}
+	if limit.set {
 		file, err = h.queries.SetFileExpiry(r.Context(), sqlcgen.SetFileExpiryParams{
-			ExpiresAt: sql.NullTime{Time: time.Now().Add(dur), Valid: true},
+			ExpiresAt: limit.expiresAt,
+			MaxViews:  limit.maxViews,
 			Slug:      slug,
 			UserID:    user.ID,
 		})
-	case req.MaxViews != nil:
-		if *req.MaxViews <= 0 {
-			http.Error(w, "max_views must be positive", http.StatusBadRequest)
-			return
-		}
-		file, err = h.queries.SetFileExpiry(r.Context(), sqlcgen.SetFileExpiryParams{
-			MaxViews: sql.NullInt64{Int64: *req.MaxViews, Valid: true},
-			Slug:     slug,
-			UserID:   user.ID,
-		})
-	default:
+	} else {
 		file, err = h.queries.ClearFileExpiry(r.Context(), sqlcgen.ClearFileExpiryParams{
 			Slug:   slug,
 			UserID: user.ID,
@@ -575,10 +830,9 @@ func (h *FilesHandler) SetExpiry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	item := toFileResponse(file)
 	item.HTMLContent = ""
-	json.NewEncoder(w).Encode(item)
+	writeJSON(w, item)
 }
 
 type renameFileRequest struct {
@@ -593,13 +847,16 @@ func (h *FilesHandler) Rename(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 
 	var req renameFileRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	if !decodeSmallJSON(w, r, &req) {
 		return
 	}
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	if len(name) > maxNameBytes {
+		http.Error(w, fmt.Sprintf("name must be at most %d bytes", maxNameBytes), http.StatusBadRequest)
 		return
 	}
 
@@ -618,10 +875,9 @@ func (h *FilesHandler) Rename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	item := toFileResponse(file)
 	item.HTMLContent = ""
-	json.NewEncoder(w).Encode(item)
+	writeJSON(w, item)
 }
 
 type setVisibilityRequest struct {
@@ -636,8 +892,7 @@ func (h *FilesHandler) SetVisibility(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 
 	var req setVisibilityRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	if !decodeSmallJSON(w, r, &req) {
 		return
 	}
 
@@ -656,10 +911,9 @@ func (h *FilesHandler) SetVisibility(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	item := toFileResponse(file)
 	item.HTMLContent = ""
-	json.NewEncoder(w).Encode(item)
+	writeJSON(w, item)
 }
 
 type setTagsRequest struct {
@@ -674,8 +928,11 @@ func (h *FilesHandler) SetTags(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 
 	var req setTagsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	if !decodeSmallJSON(w, r, &req) {
+		return
+	}
+	if len(req.Tags) > maxTagsBytes {
+		http.Error(w, fmt.Sprintf("tags must be at most %d bytes", maxTagsBytes), http.StatusBadRequest)
 		return
 	}
 
@@ -694,10 +951,9 @@ func (h *FilesHandler) SetTags(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	item := toFileResponse(file)
 	item.HTMLContent = ""
-	json.NewEncoder(w).Encode(item)
+	writeJSON(w, item)
 }
 
 func (h *FilesHandler) RefreshCode(w http.ResponseWriter, r *http.Request) {
@@ -729,10 +985,9 @@ func (h *FilesHandler) RefreshCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	item := toFileResponse(file)
 	item.HTMLContent = ""
-	json.NewEncoder(w).Encode(item)
+	writeJSON(w, item)
 }
 
 // Delete moves a file to the trash at DELETE /api/files/{slug}. A slug that
@@ -790,7 +1045,79 @@ func (h *FilesHandler) HardDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+type emptyTrashResponse struct {
+	Deleted int64 `json:"deleted"`
+}
+
+// EmptyTrash permanently deletes every file in the caller's trash at
+// DELETE /api/trash, and reports how many rows went. It lives outside
+// /api/files on purpose: a static segment there (as /api/files/search once was)
+// shadows any custom slug of the same name, and this one is a *delete*, so that
+// bug would silently aim at the wrong file.
+//
+// An already-empty trash is a success with deleted=0, not a 404: the request
+// asks for a state ("my trash is empty") and that state holds either way.
+func (h *FilesHandler) EmptyTrash(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+
+	rows, err := h.queries.HardDeleteUserTrash(r.Context(), user.ID)
+	if err != nil {
+		h.logger.Error("empty trash", "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	h.logger.Info("trash emptied", "user_id", user.ID, "files", rows)
+
+	writeJSON(w, emptyTrashResponse{Deleted: rows})
+}
+
 const accessDeniedBody = `<!doctype html><html><head><meta charset="utf-8"><title>Access denied</title></head><body><p>Access denied.</p></body></html>`
+
+// userContentCSP sandboxes everything served at /res/{slug}, and it is the one
+// header standing between "we serve uploader HTML verbatim" and "any account
+// can take over any other".
+//
+// Uploaded documents are served from the same origin as the app's own API. The
+// session cookie is HttpOnly, which stops a script reading it -- but not from
+// *using* it: a same-origin fetch carries it automatically, and SameSite=Lax
+// has nothing to say about a request that is not cross-site. So a document
+// uploaded by one user and opened by another, signed in, ran as that viewer.
+// It could read and delete their files, and against the super admin it could
+// download the whole database (every password hash and API key) or reset their
+// password and lock them out. That was fine while the only uploader was the
+// person running the server; it stopped being fine when the app grew accounts
+// and a registration toggle, and the reasoning did not get revisited.
+//
+// Omitting allow-same-origin is the entire point: it puts the document in an
+// opaque origin, so relative fetches to /api are cross-origin, arrive without
+// cookies, and are refused for lack of CORS headers. document.cookie and
+// storage are dead there too. Everything a shared document legitimately does
+// still works -- scripts run, links navigate, forms submit, popups open -- so
+// this costs the feature nothing.
+//
+// Operators who want to remove even the sandbox can serve /res from a separate
+// hostname, which is the stronger form of the same fix.
+const userContentCSP = "sandbox allow-scripts allow-forms allow-modals " +
+	"allow-popups allow-popups-to-escape-sandbox allow-downloads " +
+	"allow-top-navigation-by-user-activation"
+
+// setUserContentHeaders prepares a response carrying uploader-authored bytes.
+// Referrer-Policy is not decoration: the access code travels in the query
+// string, so without it every external image or script in a shared document
+// hands that code to a third party in the Referer header.
+func setUserContentHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	// Undo the router's blanket X-Frame-Options: embedding a document you
+	// published is reasonable, and the sandbox above is what contains it.
+	h.Del("X-Frame-Options")
+	h.Set("Content-Security-Policy", userContentCSP)
+	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("X-Content-Type-Options", "nosniff")
+}
 
 // Render serves a file's content at GET /res/{slug}?code=<access_code>. The
 // served bytes depend on the file's kind (see renderContent): html verbatim,
@@ -822,12 +1149,21 @@ func (h *FilesHandler) Render(w http.ResponseWriter, r *http.Request) {
 
 	// Lazy expiry: a public file whose TTL has passed or whose view quota is
 	// used up is flipped to private at access time (no cron). This clears the
-	// limit columns and does not touch updated_at.
+	// limit columns, records which limit fired so the owner's dashboard can say
+	// why the link stopped working, and does not touch updated_at.
 	if file.IsPublic {
-		expired := (file.ExpiresAt.Valid && !time.Now().Before(file.ExpiresAt.Time)) ||
-			(file.MaxViews.Valid && file.ViewCount >= file.MaxViews.Int64)
-		if expired {
-			if err := h.queries.ExpireFile(r.Context(), file.Slug); err != nil {
+		reason := ""
+		switch {
+		case file.ExpiresAt.Valid && !time.Now().Before(file.ExpiresAt.Time):
+			reason = ExpiryReasonTTL
+		case file.MaxViews.Valid && file.ViewCount >= file.MaxViews.Int64:
+			reason = ExpiryReasonViews
+		}
+		if reason != "" {
+			if err := h.queries.ExpireFile(r.Context(), sqlcgen.ExpireFileParams{
+				ExpiredReason: reason,
+				Slug:          file.Slug,
+			}); err != nil {
 				h.logger.Warn("expire file", "error", err)
 			}
 			file.IsPublic = false
@@ -856,7 +1192,7 @@ func (h *FilesHandler) Render(w http.ResponseWriter, r *http.Request) {
 				h.logger.Warn("increment view count", "error", err)
 			}
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		setUserContentHeaders(w)
 		w.Write(renderContent(file.Kind, file.Name, file.HtmlContent))
 		return
 	}
@@ -864,7 +1200,7 @@ func (h *FilesHandler) Render(w http.ResponseWriter, r *http.Request) {
 	if err := h.queries.IncrementFileFailureCount(r.Context(), file.Slug); err != nil {
 		h.logger.Warn("increment failure count", "error", err)
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	setUserContentHeaders(w)
 	w.WriteHeader(http.StatusForbidden)
 	w.Write([]byte(accessDeniedBody))
 }

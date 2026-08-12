@@ -16,11 +16,24 @@ import (
 	"github.com/shawn-bluce/renderbin/backend/internal/server"
 )
 
+// Defaults shared with the CLI subcommands, which have to reach the same
+// database the server would.
+const (
+	defaultListenAddr = ":8080"
+	defaultDBPath     = "data/app.db"
+)
+
 func main() {
+	// Argument-less invocation starts the server (what the container's
+	// ENTRYPOINT does); anything else is a subcommand — see cli.go.
+	if code, handled := runCLI(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); handled {
+		os.Exit(code)
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
-	addr := envOr("LISTEN_ADDR", ":8080")
-	dbPath := envOr("DB_PATH", "data/app.db")
+	addr := envOr("LISTEN_ADDR", defaultListenAddr)
+	dbPath := envOr("DB_PATH", defaultDBPath)
 
 	if err := os.MkdirAll(dirOf(dbPath), 0o755); err != nil {
 		logger.Error("create db dir", "error", err)

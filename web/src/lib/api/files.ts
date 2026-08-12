@@ -4,6 +4,8 @@ export interface FileItem {
 	slug: string;
 	name: string;
 	kind: FileKind;
+	/** Stored source length in bytes, from the server's content_size column. */
+	size: number;
 	is_public: boolean;
 	access_code: string;
 	tags: string;
@@ -16,6 +18,13 @@ export interface FileItem {
 	expires_at?: string | null;
 	max_views?: number | null;
 	view_count?: number;
+	/**
+	 * When a time or view limit last took this link offline, and which limit it
+	 * was. Only the latest event is kept, and configuring a new limit clears it
+	 * — so the row shows the badge only while the file is still private.
+	 */
+	expired_at?: string | null;
+	expired_reason?: '' | 'ttl' | 'views';
 }
 
 // ApiError keeps the HTTP status so callers can map known failures (e.g. a
@@ -55,11 +64,16 @@ export interface SearchResult extends FileItem {
 	snippet?: string;
 }
 
-/** Substring search over the current user's own files (name-only by default). */
+/**
+ * Substring search over the current user's own files (name-only by default).
+ *
+ * Not `/api/files/search`: that shadowed any file whose custom slug happened to
+ * be "search", since a static path segment wins over `{slug}` on the server.
+ */
 export function searchFiles(query: string, content: boolean): Promise<SearchResult[]> {
 	const params = new URLSearchParams({ q: query });
 	if (content) params.set('content', 'true');
-	return fetch(`/api/files/search?${params}`).then((res) => unwrap<SearchResult[]>(res));
+	return fetch(`/api/search?${params}`).then((res) => unwrap<SearchResult[]>(res));
 }
 
 export function listTrashed(): Promise<FileItem[]> {
@@ -148,4 +162,13 @@ export async function deleteFilePermanent(slug: string): Promise<void> {
 	if (!res.ok) {
 		await throwApiError(res);
 	}
+}
+
+/**
+ * Permanently delete everything in the trash, returning how many files went.
+ * Outside `/api/files` for the same reason as `searchFiles` — and it matters
+ * more here, since this one deletes.
+ */
+export function emptyTrash(): Promise<{ deleted: number }> {
+	return fetch('/api/trash', { method: 'DELETE' }).then((res) => unwrap<{ deleted: number }>(res));
 }

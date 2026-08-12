@@ -1,7 +1,7 @@
 name: Release
 
 # Tags are the only trigger: pushing vX.Y.Z publishes, everything else just
-# runs CI. See doc/releasing.html for the tagging rules.
+# runs CI. Tagging rules live in README.md under "Releasing".
 on:
   push:
     tags: ['v*']
@@ -120,7 +120,11 @@ jobs:
           for arch in amd64 arm64; do
             (cd backend && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
                go build -trimpath -ldflags "$LDFLAGS" -o ../dist/renderbin ./cmd/server)
-            tar -czf "dist/renderbin_${VERSION}_linux_${arch}.tar.gz" \
+            # No version in the tarball name, on purpose: a versioned asset can
+            # never be fetched through /releases/latest/download/, which is the
+            # URL the README tells people to curl. The version is stamped into
+            # the binary (buildinfo.Version) and reported by /api/health.
+            tar -czf "dist/renderbin_linux_${arch}.tar.gz" \
               -C dist renderbin -C .. LICENSE README.md
             rm dist/renderbin
           done

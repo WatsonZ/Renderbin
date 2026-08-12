@@ -5,7 +5,7 @@
 	import { superForm, defaults } from 'sveltekit-superforms';
 	import { zod4 as zod, zod4Client as zodClient } from 'sveltekit-superforms/adapters';
 	import { loginSchema } from '$lib/schemas/login';
-	import { login } from '$lib/api/auth';
+	import { AuthApiError, login } from '$lib/api/auth';
 	import { t } from '$lib/i18n/index.svelte';
 	import type { MessageKey } from '$lib/i18n/messages';
 	import LanguageSwitcher from '$lib/components/LanguageSwitcher.svelte';
@@ -23,8 +23,14 @@
 			try {
 				await login(form.data.username, form.data.password);
 				await goto(resolve('/'));
-			} catch {
-				errorMessage = t('login.invalidCredentials');
+			} catch (err) {
+				// 403 means the credentials were correct but the account is
+				// suspended; showing "wrong password" there would have someone
+				// retyping a password that works.
+				errorMessage =
+					err instanceof AuthApiError && err.status === 403
+						? t('login.accountDisabled')
+						: t('login.invalidCredentials');
 			}
 		}
 	});

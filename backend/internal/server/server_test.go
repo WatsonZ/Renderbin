@@ -1,6 +1,7 @@
 package server_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -31,6 +32,7 @@ const (
 type testEnv struct {
 	srv     *httptest.Server
 	queries *sqlcgen.Queries
+	conn    *sql.DB
 	admin   sqlcgen.User
 }
 
@@ -49,7 +51,7 @@ func newBareEnv(t *testing.T) *testEnv {
 	srv := httptest.NewServer(server.New(queries, conn, logger))
 	t.Cleanup(srv.Close)
 
-	return &testEnv{srv: srv, queries: queries}
+	return &testEnv{srv: srv, queries: queries, conn: conn}
 }
 
 // newEnv additionally seeds the super admin (id=1, testUser/testPass), the
@@ -155,6 +157,8 @@ type fileResp struct {
 	ExpiresAt        *string `json:"expires_at"`
 	MaxViews         *int64  `json:"max_views"`
 	ViewCount        int64   `json:"view_count"`
+	ExpiredAt        *string `json:"expired_at"`
+	ExpiredReason    string  `json:"expired_reason"`
 }
 
 func decodeFile(t *testing.T, resp *http.Response) fileResp {
@@ -512,8 +516,16 @@ func TestSetExpiry(t *testing.T) {
 	assertStatus(t, resp, http.StatusBadRequest)
 	resp.Body.Close()
 
+	// An arbitrary amount plus a unit is accepted, not just the old presets.
+	resp = e.do(t, http.MethodPatch, "/api/files/"+f.Slug+"/expiry", `{"ttl":"3mo"}`, cookie)
+	assertStatus(t, resp, http.StatusOK)
+	got = decodeFile(t, resp)
+	if got.ExpiresAt == nil {
+		t.Error("a calendar-unit ttl should set expires_at")
+	}
+
 	// Invalid ttl -> 400.
-	resp = e.do(t, http.MethodPatch, "/api/files/"+f.Slug+"/expiry", `{"ttl":"99h"}`, cookie)
+	resp = e.do(t, http.MethodPatch, "/api/files/"+f.Slug+"/expiry", `{"ttl":"99x"}`, cookie)
 	assertStatus(t, resp, http.StatusBadRequest)
 	resp.Body.Close()
 
@@ -745,6 +757,56 @@ func TestRenderViewLimitExpiry(t *testing.T) {
 	if f.MaxViews.Valid {
 		t.Error("limits should be cleared after expiry")
 	}
+	// Clearing the limits erases the evidence, so the reason is recorded before
+	// they go: without it the dashboard can only say "private" and the owner has
+	// no way to tell a link that ran out from one they made private themselves.
+	if f.ExpiredReason != "views" || !f.ExpiredAt.Valid {
+		t.Errorf("expiry marker = %q at %v, want views with a timestamp", f.ExpiredReason, f.ExpiredAt)
+	}
+	// ...and the owner sees it on the file.
+	resp = e.do(t, http.MethodGet, "/api/files/limited", "", e.authCookie(t))
+	assertStatus(t, resp, http.StatusOK)
+	if got := decodeFile(t, resp); got.ExpiredReason != "views" || got.ExpiredAt == nil {
+		t.Errorf("api reports marker %q at %v, want views with a timestamp", got.ExpiredReason, got.ExpiredAt)
+	}
+}
+
+// TestRenderTTLExpiry is the time-based half of lazy expiry: the deadline is
+// checked on access, with no cron to do it.
+func TestRenderTTLExpiry(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.createRaw(t, "stale", "c", "<h1>x</h1>", true)
+	if _, err := e.queries.SetFileExpiry(ctx, sqlcgen.SetFileExpiryParams{
+		ExpiresAt: sql.NullTime{Time: time.Now().Add(-time.Minute), Valid: true},
+		Slug:      "stale",
+		UserID:    e.admin.ID,
+	}); err != nil {
+		t.Fatalf("SetFileExpiry: %v", err)
+	}
+
+	resp := e.do(t, http.MethodGet, "/res/stale?code=c", "", nil)
+	assertStatus(t, resp, http.StatusForbidden)
+	resp.Body.Close()
+
+	f, err := e.queries.GetFileBySlugAnyOwner(ctx, "stale")
+	if err != nil {
+		t.Fatalf("GetFileBySlugAnyOwner: %v", err)
+	}
+	if f.IsPublic || f.ExpiresAt.Valid {
+		t.Errorf("expired file = public %v, expires_at %v; want private with no limit", f.IsPublic, f.ExpiresAt)
+	}
+	if f.ExpiredReason != "ttl" {
+		t.Errorf("expiry marker = %q, want ttl", f.ExpiredReason)
+	}
+
+	// Re-publishing with a fresh limit clears the marker, so the badge can
+	// never sit next to a live expiry it contradicts.
+	resp = e.do(t, http.MethodPatch, "/api/files/stale/expiry", `{"ttl":"24h"}`, e.authCookie(t))
+	assertStatus(t, resp, http.StatusOK)
+	if got := decodeFile(t, resp); got.ExpiredReason != "" || got.ExpiredAt != nil {
+		t.Errorf("marker = %q at %v, want cleared by a new limit", got.ExpiredReason, got.ExpiredAt)
+	}
 }
 
 func TestRenderAdminDoesNotConsumeQuota(t *testing.T) {
@@ -832,6 +894,125 @@ func TestBackupDownload(t *testing.T) {
 	if !strings.HasPrefix(body, "SQLite format 3\x00") {
 		t.Errorf("backup body does not look like a SQLite database (first bytes: %q)", body[:min(16, len(body))])
 	}
+}
+
+// TestBackupRestoreRoundTrip is the whole point of the pair: download a
+// snapshot, change everything, upload the snapshot back, and find the original
+// state — through the same live server, with no restart in between.
+func TestBackupRestoreRoundTrip(t *testing.T) {
+	e := newEnv(t)
+	cookie := e.authCookie(t)
+
+	original := e.createViaAPI(t, cookie, "before backup", "<h1>original</h1>")
+	snapshot := e.download(t, "/api/backup", cookie)
+
+	// Diverge: add a file, delete the original one.
+	added := e.createViaAPI(t, cookie, "after backup", "<p>new</p>")
+	resp := e.do(t, http.MethodDelete, "/api/files/"+original.Slug, "", cookie)
+	assertStatus(t, resp, http.StatusNoContent)
+	resp.Body.Close()
+
+	restored := e.restore(t, snapshot, cookie)
+	assertStatus(t, restored, http.StatusOK)
+	var out struct {
+		Users int64 `json:"users"`
+		Files int64 `json:"files"`
+	}
+	if err := json.NewDecoder(restored.Body).Decode(&out); err != nil {
+		t.Fatalf("decode restore response: %v", err)
+	}
+	restored.Body.Close()
+	if out.Users != 1 || out.Files != 1 {
+		t.Errorf("restore reported %+v, want 1 user / 1 file", out)
+	}
+
+	// The same running server now serves the snapshot's data: the original file
+	// is back and the one added afterwards is gone. A fresh session is needed
+	// because the snapshot's sessions table replaced the live one.
+	after := e.cookieFor(t, e.admin.ID)
+	resp = e.do(t, http.MethodGet, "/api/files/"+original.Slug, "", after)
+	assertStatus(t, resp, http.StatusOK)
+	if got := decodeFile(t, resp); got.HTMLContent != "<h1>original</h1>" {
+		t.Errorf("restored content = %q", got.HTMLContent)
+	}
+	resp = e.do(t, http.MethodGet, "/api/files/"+added.Slug, "", after)
+	assertStatus(t, resp, http.StatusNotFound)
+	resp.Body.Close()
+
+	// And the restored database keeps working for writes — the id sequence came
+	// across with the rows, so a new file doesn't collide with a restored id.
+	e.createViaAPI(t, after, "after restore", "<p>fresh</p>")
+}
+
+// download returns a response body as bytes, for endpoints that stream files.
+func (e *testEnv) download(t *testing.T, path string, cookie *http.Cookie) []byte {
+	t.Helper()
+	resp := e.do(t, http.MethodGet, path, "", cookie)
+	assertStatus(t, resp, http.StatusOK)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return body
+}
+
+// restore POSTs a raw database file to the restore endpoint. The body is the
+// file itself, with no multipart wrapper.
+func (e *testEnv) restore(t *testing.T, snapshot []byte, cookie *http.Cookie) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, e.srv.URL+"/api/backup/restore", bytes.NewReader(snapshot))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	resp, err := e.srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("POST /api/backup/restore: %v", err)
+	}
+	return resp
+}
+
+func TestRestoreRejections(t *testing.T) {
+	e := newEnv(t)
+	cookie := e.authCookie(t)
+	kept := e.createViaAPI(t, cookie, "keep me", "<p>safe</p>")
+	snapshot := e.download(t, "/api/backup", cookie)
+
+	// A signed-in non-admin: this writes over everyone's data at once.
+	_, otherCookie := e.newUser(t, "other")
+	resp := e.restore(t, snapshot, otherCookie)
+	assertStatus(t, resp, http.StatusForbidden)
+	resp.Body.Close()
+
+	resp = e.restore(t, snapshot, nil)
+	assertStatus(t, resp, http.StatusUnauthorized)
+	resp.Body.Close()
+
+	// Not a database at all, and an empty body.
+	for _, c := range []struct {
+		name string
+		body []byte
+		want int
+	}{
+		{"not a database", []byte("just some notes, not a database at all"), http.StatusBadRequest},
+		{"empty upload", nil, http.StatusBadRequest},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			resp := e.restore(t, c.body, cookie)
+			assertStatus(t, resp, c.want)
+			resp.Body.Close()
+		})
+	}
+
+	// Every rejection above must have left the live data untouched — that is
+	// what makes it safe to report the problem instead of a lost database.
+	resp = e.do(t, http.MethodGet, "/api/files/"+kept.Slug, "", cookie)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
 }
 
 func TestSPAFallback(t *testing.T) {
@@ -1030,7 +1211,7 @@ type searchResp struct {
 
 func (e *testEnv) search(t *testing.T, cookie *http.Cookie, query string) []searchResp {
 	t.Helper()
-	resp := e.do(t, http.MethodGet, "/api/files/search?"+query, "", cookie)
+	resp := e.do(t, http.MethodGet, "/api/search?"+query, "", cookie)
 	assertStatus(t, resp, http.StatusOK)
 	defer resp.Body.Close()
 	var out []searchResp
@@ -1090,7 +1271,7 @@ func TestSearchFiles(t *testing.T) {
 	}
 
 	// Search requires auth.
-	resp := e.do(t, http.MethodGet, "/api/files/search?q=hello", "", nil)
+	resp := e.do(t, http.MethodGet, "/api/search?q=hello", "", nil)
 	assertStatus(t, resp, http.StatusUnauthorized)
 	resp.Body.Close()
 }
@@ -1113,6 +1294,328 @@ func TestSearchScopedToOwnFiles(t *testing.T) {
 	if len(otherResults) != 1 || otherResults[0].Name != "hello other file" {
 		t.Errorf("other search = %+v, want only their own file", otherResults)
 	}
+}
+
+func TestEmptyTrash(t *testing.T) {
+	e := newEnv(t)
+	cookie := e.authCookie(t)
+	_, otherCookie := e.newUser(t, "other")
+
+	live := e.createViaAPI(t, cookie, "live", "<p>keep</p>")
+	trashed := e.createViaAPI(t, cookie, "trashed", "<p>gone</p>")
+	theirs := e.createViaAPI(t, otherCookie, "theirs", "<p>mine</p>")
+	for _, c := range []struct {
+		slug   string
+		cookie *http.Cookie
+	}{{trashed.Slug, cookie}, {theirs.Slug, otherCookie}} {
+		resp := e.do(t, http.MethodDelete, "/api/files/"+c.slug, "", c.cookie)
+		assertStatus(t, resp, http.StatusNoContent)
+		resp.Body.Close()
+	}
+
+	resp := e.do(t, http.MethodDelete, "/api/trash", "", cookie)
+	assertStatus(t, resp, http.StatusOK)
+	var out struct {
+		Deleted int64 `json:"deleted"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode empty-trash response: %v", err)
+	}
+	resp.Body.Close()
+	if out.Deleted != 1 {
+		t.Errorf("deleted = %d, want 1", out.Deleted)
+	}
+
+	// The live file is untouched -- this endpoint is the only bulk delete in
+	// the API, so "it took only the trash" is the property that matters.
+	resp = e.do(t, http.MethodGet, "/api/files/"+live.Slug, "", cookie)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+	// And it is owner-scoped: the other user still has their own trash.
+	resp = e.do(t, http.MethodPost, "/api/files/"+theirs.Slug+"/restore", "", otherCookie)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	// Emptying an already-empty trash succeeds with 0 rather than 404.
+	resp = e.do(t, http.MethodDelete, "/api/trash", "", cookie)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	resp = e.do(t, http.MethodDelete, "/api/trash", "", nil)
+	assertStatus(t, resp, http.StatusUnauthorized)
+	resp.Body.Close()
+}
+
+// rawSessionCookie returns the Set-Cookie exactly as sent, attributes included.
+// cookieFrom deliberately keeps only name and value, since its result is meant
+// to be attached to a request; these assertions are about the attributes.
+func rawSessionCookie(t *testing.T, resp *http.Response) *http.Cookie {
+	t.Helper()
+	for _, c := range resp.Cookies() {
+		if c.Name == auth.SessionCookieName {
+			return c
+		}
+	}
+	t.Fatal("response did not set a session cookie")
+	return nil
+}
+
+// TestSessionCookieSecureFollowsScheme pins the fix for a login that silently
+// never took: the cookie was unconditionally Secure, and a browser discards a
+// Secure cookie arriving over plain HTTP from anything but localhost — so
+// self-hosting on a LAN address looked like a rejected password with no error.
+func TestSessionCookieSecureFollowsScheme(t *testing.T) {
+	e := newEnv(t)
+	body := fmt.Sprintf(`{"username":%q,"password":%q}`, testUser, testPass)
+
+	// The test server speaks plain HTTP, which is the LAN case.
+	resp := e.do(t, http.MethodPost, "/api/auth/login", body, nil)
+	assertStatus(t, resp, http.StatusNoContent)
+	if c := rawSessionCookie(t, resp); c.Secure {
+		t.Error("cookie must not be Secure over plain HTTP, or the browser drops it and login appears to fail")
+	}
+	resp.Body.Close()
+
+	// A terminating proxy is the third deployment: the backend sees HTTP, the
+	// browser saw HTTPS, and only the forwarded header says so.
+	req, err := http.NewRequest(http.MethodPost, e.srv.URL+"/api/auth/login", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	resp, err = e.srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("login through proxy: %v", err)
+	}
+	assertStatus(t, resp, http.StatusNoContent)
+	if c := rawSessionCookie(t, resp); !c.Secure {
+		t.Error("cookie must be Secure when the browser reached us over HTTPS")
+	}
+	resp.Body.Close()
+
+	// Logout mirrors it, so the deletion targets the cookie that was set.
+	resp = e.do(t, http.MethodPost, "/api/auth/logout", "", nil)
+	assertStatus(t, resp, http.StatusNoContent)
+	if c := rawSessionCookie(t, resp); c.Secure {
+		t.Error("logout over plain HTTP should clear a non-Secure cookie")
+	}
+	resp.Body.Close()
+}
+
+// --- account management ---
+
+type adminUserResp struct {
+	ID           int64  `json:"id"`
+	Username     string `json:"username"`
+	IsSuperAdmin bool   `json:"is_super_admin"`
+	Disabled     bool   `json:"disabled"`
+	FileCount    int64  `json:"file_count"`
+	TrashedCount int64  `json:"trashed_count"`
+}
+
+func (e *testEnv) adminUsers(t *testing.T, cookie *http.Cookie) []adminUserResp {
+	t.Helper()
+	resp := e.do(t, http.MethodGet, "/api/admin/users", "", cookie)
+	assertStatus(t, resp, http.StatusOK)
+	defer resp.Body.Close()
+	var out []adminUserResp
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode users: %v", err)
+	}
+	return out
+}
+
+func TestAdminListsUsersWithFileCounts(t *testing.T) {
+	e := newEnv(t)
+	cookie := e.authCookie(t)
+	user, userCookie := e.newUser(t, "bob")
+
+	e.createViaAPI(t, cookie, "admin file", "<p>1</p>")
+	trashed := e.createViaAPI(t, userCookie, "bob file", "<p>2</p>")
+	e.createViaAPI(t, userCookie, "bob live", "<p>3</p>")
+	resp := e.do(t, http.MethodDelete, "/api/files/"+trashed.Slug, "", userCookie)
+	assertStatus(t, resp, http.StatusNoContent)
+	resp.Body.Close()
+
+	users := e.adminUsers(t, cookie)
+	if len(users) != 2 {
+		t.Fatalf("got %d users, want 2", len(users))
+	}
+	if !users[0].IsSuperAdmin || users[1].IsSuperAdmin {
+		t.Errorf("super admin flag = %v/%v, want only the first", users[0].IsSuperAdmin, users[1].IsSuperAdmin)
+	}
+	if users[0].FileCount != 1 || users[1].FileCount != 1 || users[1].TrashedCount != 1 {
+		t.Errorf("counts = %+v", users)
+	}
+
+	// The page is for the super admin only; an ordinary account gets 403 (the
+	// path exists, only the privilege is in question), not 404.
+	resp = e.do(t, http.MethodGet, "/api/admin/users", "", userCookie)
+	assertStatus(t, resp, http.StatusForbidden)
+	resp.Body.Close()
+	for _, c := range []struct{ method, path, body string }{
+		{http.MethodPatch, "/api/admin/users/1/status", `{"disabled":true}`},
+		{http.MethodPost, fmt.Sprintf("/api/admin/users/%d/password", user.ID), `{"new_password":"hijacked"}`},
+	} {
+		resp = e.do(t, c.method, c.path, c.body, userCookie)
+		assertStatus(t, resp, http.StatusForbidden)
+		resp.Body.Close()
+	}
+	// ...and to be sure the 403 was the privilege check rather than a bad
+	// payload, the password above must not have been applied.
+	if !auth.VerifyPassword(e.currentHash(t, user.ID), "secret2") {
+		t.Error("a rejected admin request changed the target's password anyway")
+	}
+}
+
+// currentHash reads a user's stored password hash, for asserting that a
+// rejected request did not change it.
+func (e *testEnv) currentHash(t *testing.T, id int64) string {
+	t.Helper()
+	u, err := e.queries.GetUserByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetUserByID: %v", err)
+	}
+	return u.PasswordHash
+}
+
+// TestAdminSuspendAccount covers every door a suspension has to close: the
+// login form, sessions already issued, the MCP key, and the public links to
+// files the account owns.
+func TestAdminSuspendAccount(t *testing.T) {
+	e := newEnv(t)
+	adminCookie := e.authCookie(t)
+	user, userCookie := e.newUser(t, "bob")
+
+	// Give bob a published file and an MCP key.
+	file := e.createViaAPI(t, userCookie, "bob public", "<p>bob</p>")
+	resp := e.do(t, http.MethodPatch, "/api/files/"+file.Slug+"/visibility", `{"is_public":true}`, userCookie)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+	if err := e.queries.SetConfig(context.Background(), sqlcgen.SetConfigParams{
+		Key: "mcp_enabled", Value: "true",
+	}); err != nil {
+		t.Fatalf("SetConfig: %v", err)
+	}
+	bobKey, err := auth.NewAPIKey()
+	if err != nil {
+		t.Fatalf("NewAPIKey: %v", err)
+	}
+	if err := e.queries.SetUserAPIKey(context.Background(), sqlcgen.SetUserAPIKeyParams{
+		ApiKey: sql.NullString{String: bobKey, Valid: true}, ID: user.ID,
+	}); err != nil {
+		t.Fatalf("SetUserAPIKey: %v", err)
+	}
+
+	publicURL := "/res/" + file.Slug + "?code=" + file.AccessCode
+	resp = e.do(t, http.MethodGet, publicURL, "", nil)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	// Suspend.
+	resp = e.do(t, http.MethodPatch, fmt.Sprintf("/api/admin/users/%d/status", user.ID), `{"disabled":true}`, adminCookie)
+	assertStatus(t, resp, http.StatusNoContent)
+	resp.Body.Close()
+
+	if users := e.adminUsers(t, adminCookie); !users[1].Disabled {
+		t.Error("list should report the account as disabled")
+	}
+	// The password still verifies, so this 403 is about the account's state.
+	resp = e.do(t, http.MethodPost, "/api/auth/login", `{"username":"bob","password":"secret2"}`, nil)
+	assertStatus(t, resp, http.StatusForbidden)
+	resp.Body.Close()
+	// An existing session stops working on its very next request.
+	resp = e.do(t, http.MethodGet, "/api/files", "", userCookie)
+	assertStatus(t, resp, http.StatusUnauthorized)
+	resp.Body.Close()
+	// The MCP key dies with it, or suspension would leave the agent door open.
+	resp = e.mcpCall(t, bobKey, "list_files", map[string]any{})
+	assertStatus(t, resp, http.StatusUnauthorized)
+	resp.Body.Close()
+	// And the account's public links read as nonexistent, not merely forbidden.
+	resp = e.do(t, http.MethodGet, publicURL, "", nil)
+	assertStatus(t, resp, http.StatusNotFound)
+	resp.Body.Close()
+	// The super admin's own files are unaffected by someone else's suspension.
+	adminFile := e.createViaAPI(t, adminCookie, "admin file", "<p>admin</p>")
+	resp = e.do(t, http.MethodGet, "/res/"+adminFile.Slug, "", adminCookie)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	// Restore: everything comes back, including the link.
+	resp = e.do(t, http.MethodPatch, fmt.Sprintf("/api/admin/users/%d/status", user.ID), `{"disabled":false}`, adminCookie)
+	assertStatus(t, resp, http.StatusNoContent)
+	resp.Body.Close()
+	resp = e.do(t, http.MethodPost, "/api/auth/login", `{"username":"bob","password":"secret2"}`, nil)
+	assertStatus(t, resp, http.StatusNoContent)
+	restored := cookieFrom(t, resp)
+	resp.Body.Close()
+	resp = e.do(t, http.MethodGet, "/api/files", "", restored)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+	resp = e.do(t, http.MethodGet, publicURL, "", nil)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+}
+
+// The super admin is the only account that can lift a suspension, so letting it
+// suspend itself would be a one-way door out of the app.
+func TestAdminCannotDisableSuperAdmin(t *testing.T) {
+	e := newEnv(t)
+	cookie := e.authCookie(t)
+
+	resp := e.do(t, http.MethodPatch, "/api/admin/users/1/status", `{"disabled":true}`, cookie)
+	assertStatus(t, resp, http.StatusForbidden)
+	resp.Body.Close()
+
+	resp = e.do(t, http.MethodGet, "/api/auth/me", "", cookie)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	// An unknown id is a missing object (404); a non-numeric one could never
+	// name a row and is a malformed request (400).
+	resp = e.do(t, http.MethodPatch, "/api/admin/users/9999/status", `{"disabled":true}`, cookie)
+	assertStatus(t, resp, http.StatusNotFound)
+	resp.Body.Close()
+	resp = e.do(t, http.MethodPatch, "/api/admin/users/abc/status", `{"disabled":true}`, cookie)
+	assertStatus(t, resp, http.StatusBadRequest)
+	resp.Body.Close()
+}
+
+func TestAdminResetPassword(t *testing.T) {
+	e := newEnv(t)
+	adminCookie := e.authCookie(t)
+	user, userCookie := e.newUser(t, "bob")
+	path := fmt.Sprintf("/api/admin/users/%d/password", user.ID)
+
+	// Too short is rejected before anything is written.
+	resp := e.do(t, http.MethodPost, path, `{"new_password":"abc"}`, adminCookie)
+	assertStatus(t, resp, http.StatusBadRequest)
+	resp.Body.Close()
+
+	resp = e.do(t, http.MethodPost, path, `{"new_password":"brand-new-pass"}`, adminCookie)
+	assertStatus(t, resp, http.StatusNoContent)
+	resp.Body.Close()
+
+	// The new password works and the old one doesn't -- no current password
+	// was needed, which is the point: there is no self-service recovery.
+	resp = e.do(t, http.MethodPost, "/api/auth/login", `{"username":"bob","password":"brand-new-pass"}`, nil)
+	assertStatus(t, resp, http.StatusNoContent)
+	resp.Body.Close()
+	resp = e.do(t, http.MethodPost, "/api/auth/login", `{"username":"bob","password":"secret2"}`, nil)
+	assertStatus(t, resp, http.StatusUnauthorized)
+	resp.Body.Close()
+
+	// Unlike a self-service change, an admin reset ends the target's existing
+	// sessions: it is what you reach for when an account is compromised.
+	resp = e.do(t, http.MethodGet, "/api/files", "", userCookie)
+	assertStatus(t, resp, http.StatusUnauthorized)
+	resp.Body.Close()
+
+	resp = e.do(t, http.MethodPost, "/api/admin/users/9999/password", `{"new_password":"whatever1"}`, adminCookie)
+	assertStatus(t, resp, http.StatusNotFound)
+	resp.Body.Close()
 }
 
 // --- MCP endpoint ---
@@ -1274,6 +1777,140 @@ func TestMCPUploadPublishFlow(t *testing.T) {
 	assertStatus(t, resp, http.StatusOK)
 	if b := bodyString(t, resp); !strings.Contains(b, "<h1") || !strings.Contains(b, "Hello MCP") {
 		t.Errorf("published markdown did not render: %q", b)
+	}
+}
+
+// TestMCPPublishWithExpiry covers the self-expiring publish: one call has to
+// both make the file public and attach the limit, since a two-step version
+// could leave it public with no limit if the second step failed.
+func TestMCPPublishWithExpiry(t *testing.T) {
+	e := newEnv(t)
+	key := e.enableMCP(t)
+	ctx := context.Background()
+
+	byViews := e.mcpUpload(t, key, "views", "markdown", "# v")
+	viewsSlug, _ := byViews["slug"].(string)
+	res := decodeMCPResult(t, e.mcpCall(t, key, "publish_file", map[string]any{
+		"slug": viewsSlug, "max_views": 2,
+	}))
+	if res.IsError {
+		t.Fatalf("publish_file with max_views: %s", res.text())
+	}
+	if !strings.Contains(res.text(), "2 more view") {
+		t.Errorf("result %q should tell the agent how long the link lasts", res.text())
+	}
+	f, err := e.queries.GetFileBySlugAnyOwner(ctx, viewsSlug)
+	if err != nil {
+		t.Fatalf("GetFileBySlugAnyOwner: %v", err)
+	}
+	if !f.IsPublic || !f.MaxViews.Valid || f.MaxViews.Int64 != 2 {
+		t.Errorf("file = public %v, max_views %v; want public with a 2-view limit", f.IsPublic, f.MaxViews)
+	}
+
+	byTTL := e.mcpUpload(t, key, "ttl", "markdown", "# t")
+	ttlSlug, _ := byTTL["slug"].(string)
+	res = decodeMCPResult(t, e.mcpCall(t, key, "publish_file", map[string]any{
+		"slug": ttlSlug, "ttl": "7d",
+	}))
+	if res.IsError {
+		t.Fatalf("publish_file with ttl: %s", res.text())
+	}
+	if f, err = e.queries.GetFileBySlugAnyOwner(ctx, ttlSlug); err != nil {
+		t.Fatalf("GetFileBySlugAnyOwner: %v", err)
+	}
+	if !f.IsPublic || !f.ExpiresAt.Valid {
+		t.Errorf("file = public %v, expires_at %v; want public with a deadline", f.IsPublic, f.ExpiresAt)
+	}
+
+	// The same vocabulary and the same mutual-exclusion rule as the HTTP
+	// endpoint, because both go through parseExpiryLimit.
+	for _, args := range []map[string]any{
+		{"slug": ttlSlug, "ttl": "99x"},
+		{"slug": ttlSlug, "ttl": "24h", "max_views": 5},
+		{"slug": ttlSlug, "max_views": 0},
+	} {
+		if res = decodeMCPResult(t, e.mcpCall(t, key, "publish_file", args)); !res.IsError {
+			t.Errorf("publish_file%v should be a tool error", args)
+		}
+	}
+}
+
+func TestMCPUnpublish(t *testing.T) {
+	e := newEnv(t)
+	key := e.enableMCP(t)
+
+	out := e.mcpUpload(t, key, "doc", "markdown", "# hi")
+	slug, _ := out["slug"].(string)
+	url, _ := out["url"].(string)
+	if res := decodeMCPResult(t, e.mcpCall(t, key, "publish_file", map[string]any{"slug": slug})); res.IsError {
+		t.Fatalf("publish_file: %s", res.text())
+	}
+	resp := e.do(t, http.MethodGet, e.pathOf(t, url), "", nil)
+	assertStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	res := decodeMCPResult(t, e.mcpCall(t, key, "unpublish_file", map[string]any{"slug": slug}))
+	if res.IsError {
+		t.Fatalf("unpublish_file: %s", res.text())
+	}
+	if isPublic, _ := res.StructuredContent["is_public"].(bool); isPublic {
+		t.Error("unpublish_file should report the file as private")
+	}
+	resp = e.do(t, http.MethodGet, e.pathOf(t, url), "", nil)
+	assertStatus(t, resp, http.StatusForbidden)
+	resp.Body.Close()
+
+	// The document itself survives -- unpublishing is not deleting.
+	resp = e.do(t, http.MethodGet, "/api/files/"+slug, "", e.authCookie(t))
+	assertStatus(t, resp, http.StatusOK)
+	if got := decodeFile(t, resp); got.HTMLContent != "# hi" {
+		t.Errorf("content = %q, want it untouched", got.HTMLContent)
+	}
+
+	if res = decodeMCPResult(t, e.mcpCall(t, key, "unpublish_file", map[string]any{"slug": "nope"})); !res.IsError {
+		t.Error("unpublish_file on an unknown slug should be a tool error")
+	}
+}
+
+func TestMCPListFiles(t *testing.T) {
+	e := newEnv(t)
+	key := e.enableMCP(t)
+
+	// Empty project: a plain answer, not an error.
+	res := decodeMCPResult(t, e.mcpCall(t, key, "list_files", map[string]any{}))
+	if res.IsError || !strings.Contains(res.text(), "no documents") {
+		t.Errorf("list_files on an empty project = %v %q", res.IsError, res.text())
+	}
+
+	e.mcpUpload(t, key, "first", "markdown", "# one")
+	second := e.mcpUpload(t, key, "second", "html", "<p>two</p>")
+	secondSlug, _ := second["slug"].(string)
+	if res = decodeMCPResult(t, e.mcpCall(t, key, "publish_file", map[string]any{
+		"slug": secondSlug, "max_views": 3,
+	})); res.IsError {
+		t.Fatalf("publish_file: %s", res.text())
+	}
+
+	// Another user's files must not appear: list_files has no query to scope it,
+	// so the owner filter in ListUserFiles is the only thing standing there.
+	_, otherCookie := e.newUser(t, "other")
+	e.createViaAPI(t, otherCookie, "not mine", "<p>hidden</p>")
+
+	res = decodeMCPResult(t, e.mcpCall(t, key, "list_files", map[string]any{}))
+	if res.IsError {
+		t.Fatalf("list_files: %s", res.text())
+	}
+	if total, _ := res.StructuredContent["total"].(float64); total != 2 {
+		t.Errorf("total = %v, want 2 (only the key owner's files)", res.StructuredContent["total"])
+	}
+	text := res.text()
+	if strings.Contains(text, "not mine") {
+		t.Error("list_files leaked another user's file")
+	}
+	for _, want := range []string{"first", "second", "private", "3 more view"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("list_files text %q missing %q", text, want)
+		}
 	}
 }
 
@@ -1475,13 +2112,20 @@ func TestMCPOwnershipIsolation(t *testing.T) {
 	if found := res.StructuredContent["found"].(bool); found {
 		t.Error("search must not return another user's files")
 	}
-	// …and update/publish/delete all answer "not found".
+	// …list does not either…
+	res = decodeMCPResult(t, e.mcpCall(t, key, "list_files", map[string]any{}))
+	if strings.Contains(res.text(), "机密") {
+		t.Error("list must not return another user's files")
+	}
+	// …and every slug-taking tool answers "not found". Each one must appear
+	// here: a new tool that forgets ownedFile is exactly the bug this catches.
 	for _, call := range []struct {
 		tool string
 		args map[string]any
 	}{
 		{"update_file", map[string]any{"slug": theirs.Slug, "name": "hacked"}},
 		{"publish_file", map[string]any{"slug": theirs.Slug}},
+		{"unpublish_file", map[string]any{"slug": theirs.Slug}},
 		{"delete_file", map[string]any{"slug": theirs.Slug, "confirm": true}},
 	} {
 		res := decodeMCPResult(t, e.mcpCall(t, key, call.tool, call.args))
@@ -1489,8 +2133,65 @@ func TestMCPOwnershipIsolation(t *testing.T) {
 			t.Errorf("%s on foreign file = %v %q, want not-found error", call.tool, res.IsError, res.text())
 		}
 	}
-	if _, err := e.queries.GetFileBySlugAnyOwner(context.Background(), theirs.Slug); err != nil {
+	after, err := e.queries.GetFileBySlugAnyOwner(context.Background(), theirs.Slug)
+	if err != nil {
 		t.Errorf("foreign file should be untouched: %v", err)
+	} else if after.Name != theirs.Name || after.IsPublic {
+		t.Errorf("foreign file was mutated: %+v", after)
+	}
+}
+
+// TestMCPToolsAreAllTested walks the advertised tool list so a tool added
+// without a test fails here rather than shipping unexercised.
+func TestMCPToolsAreAllTested(t *testing.T) {
+	e := newEnv(t)
+	key := e.enableMCP(t)
+
+	req, err := http.NewRequest(http.MethodPost, e.srv.URL+"/mcp",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := e.srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("tools/list: %v", err)
+	}
+	defer resp.Body.Close()
+	assertStatus(t, resp, http.StatusOK)
+
+	var envelope struct {
+		Result struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode tools/list: %v", err)
+	}
+
+	// Each entry names the test that exercises the tool.
+	tested := map[string]string{
+		"upload_file":    "TestMCPUploadPublishFlow",
+		"upload_files":   "TestMCPBatchUpload",
+		"list_files":     "TestMCPListFiles",
+		"search_files":   "TestMCPSearch",
+		"update_file":    "TestMCPUpdate",
+		"publish_file":   "TestMCPPublishWithExpiry",
+		"unpublish_file": "TestMCPUnpublish",
+		"delete_file":    "TestMCPDeleteTwoPhase",
+	}
+	if len(envelope.Result.Tools) != len(tested) {
+		t.Errorf("server advertises %d tools, the test map lists %d",
+			len(envelope.Result.Tools), len(tested))
+	}
+	for _, tool := range envelope.Result.Tools {
+		if tested[tool.Name] == "" {
+			t.Errorf("MCP tool %q has no test — add one and list it here", tool.Name)
+		}
 	}
 }
 
@@ -1551,10 +2252,20 @@ func (e *testEnv) trashFingerprint(t *testing.T, ownerID int64, slug string) str
 		t.Fatalf("ListUserDeletedFiles: %v", err)
 	}
 	for _, f := range rows {
-		if f.Slug == slug {
-			return fmt.Sprintf("name=%q content=%q public=%v code=%q tags=%q",
-				f.Name, f.HtmlContent, f.IsPublic, f.AccessCode, f.Tags)
+		if f.Slug != slug {
+			continue
 		}
+		// The trash listing deliberately doesn't carry html_content (no query
+		// reachable from a listing does), so read it directly -- the point of
+		// this fingerprint is that the content is untouched.
+		var content string
+		if err := e.conn.QueryRow(
+			`SELECT html_content FROM files WHERE slug = ? AND user_id = ?`,
+			slug, ownerID).Scan(&content); err != nil {
+			t.Fatalf("read trashed content: %v", err)
+		}
+		return fmt.Sprintf("name=%q content=%q public=%v code=%q tags=%q",
+			f.Name, content, f.IsPublic, f.AccessCode, f.Tags)
 	}
 	t.Fatalf("file %q is no longer in user %d's trash", slug, ownerID)
 	return ""
@@ -1616,9 +2327,19 @@ func TestFileEndpointsRejectForeignSlug(t *testing.T) {
 	}
 }
 
-// TestFileEndpointsCoverAllRoutes walks the real router so that adding a
-// /api/files endpoint without an ownership case fails a test that already
-// exists, rather than silently going untested.
+// isFileRoute reports whether a route reads or writes files, and therefore owes
+// this file an ownership test. /api/search and /api/trash are file endpoints
+// that deliberately don't live under /api/files -- see the static-segment check
+// in TestFileEndpointsCoverAllRoutes for why.
+func isFileRoute(route string) bool {
+	return strings.HasPrefix(route, "/api/files") ||
+		route == "/api/search" || route == "/api/trash"
+}
+
+// TestFileEndpointsCoverAllRoutes walks the real router so that adding a file
+// endpoint without an ownership case fails a test that already exists, rather
+// than silently going untested. It also enforces the shape of the /api/files
+// subtree, which is a correctness property in its own right.
 func TestFileEndpointsCoverAllRoutes(t *testing.T) {
 	covered := map[string]bool{}
 	for _, c := range foreignCases {
@@ -1627,23 +2348,37 @@ func TestFileEndpointsCoverAllRoutes(t *testing.T) {
 	}
 	// Routes that are not slug-keyed and so cannot leak another user's file.
 	notSlugKeyed := map[string]bool{
-		http.MethodGet + " /api/files":        true, // covered by TestListScopedToOwner
-		http.MethodPost + " /api/files":       true, // creates, attributed to caller
-		http.MethodGet + " /api/files/search": true, // covered by TestSearchScopedToOwnFiles
+		http.MethodGet + " /api/files":    true, // covered by TestListScopedToOwner
+		http.MethodPost + " /api/files":   true, // creates, attributed to caller
+		http.MethodGet + " /api/search":   true, // covered by TestSearchScopedToOwnFiles
+		http.MethodDelete + " /api/trash": true, // covered by TestEmptyTrash
 	}
 
 	seen := 0
 	err := chi.Walk(server.New(nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).(*chi.Mux),
 		func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
 			route = strings.TrimSuffix(route, "/")
-			if !strings.HasPrefix(route, "/api/files") {
+			if !isFileRoute(route) {
 				return nil
 			}
 			seen++
 			key := method + " " + route
 			if !covered[key] && !notSlugKeyed[key] {
-				t.Errorf("route %q has no ownership test. Every /api/files endpoint must be "+
+				t.Errorf("route %q has no ownership test. Every file endpoint must be "+
 					"owner-scoped: add a foreignCase (or list it in notSlugKeyed with a reason).", key)
+			}
+			// chi matches a static segment before a parameter, so a static
+			// route at the {slug} level shadows any file whose custom slug
+			// happens to equal it: that file's own endpoint would answer with
+			// the other handler's response instead. /api/files/search used to
+			// do exactly this, which is why search moved to /api/search and
+			// emptying the trash to /api/trash. Nothing may go back.
+			if rest, ok := strings.CutPrefix(route, "/api/files/"); ok {
+				if seg, _, _ := strings.Cut(rest, "/"); seg != "{slug}" {
+					t.Errorf("route %q puts the static segment %q where a slug goes; "+
+						"a file with that slug becomes unreachable through its own endpoint. "+
+						"Mount it outside /api/files instead.", key, seg)
+				}
 			}
 			return nil
 		})
@@ -1652,7 +2387,7 @@ func TestFileEndpointsCoverAllRoutes(t *testing.T) {
 	}
 	// A prefix filter that matches nothing would make this test vacuous.
 	if want := len(foreignCases) + len(notSlugKeyed); seen != want {
-		t.Errorf("walked %d /api/files routes, expected %d — the route table and the "+
+		t.Errorf("walked %d file routes, expected %d — the route table and the "+
 			"ownership table have drifted apart", seen, want)
 	}
 }

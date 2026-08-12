@@ -47,6 +47,14 @@ func CurrentUser(r *http.Request, queries *sqlcgen.Queries) (sqlcgen.User, bool)
 	if err != nil {
 		return sqlcgen.User{}, false
 	}
+	// A suspended account is not an identity. Checking here rather than at the
+	// login door is what makes suspension take effect immediately: every
+	// authenticated path (requireAuth, /api/auth/me, and the owner bypass in
+	// /res/{slug}) resolves its user through this function, so a session issued
+	// before the suspension stops working on its very next request.
+	if user.DisabledAt.Valid {
+		return sqlcgen.User{}, false
+	}
 	return user, true
 }
 

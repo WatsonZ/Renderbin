@@ -34,9 +34,20 @@ describe('auth api', () => {
 		);
 	});
 
-	it('login throws a fixed message on failure', async () => {
+	// The status is what the login page needs: 401 is a wrong password, while a
+	// 403 means the password was right and the account is suspended, which the
+	// page reports differently.
+	it('login throws an AuthApiError carrying the status on failure', async () => {
 		mockFetch(response({ ok: false }));
-		await expect(login('admin', 'wrong')).rejects.toThrow('Invalid username or password');
+		await expect(login('admin', 'wrong')).rejects.toBeInstanceOf(AuthApiError);
+		await expect(login('admin', 'wrong')).rejects.toMatchObject({ status: 401 });
+	});
+
+	it('login surfaces a 403 (disabled account) distinctly from a 401', async () => {
+		const res = response({ ok: false });
+		(res as { status: number }).status = 403;
+		mockFetch(res);
+		await expect(login('bob', 'right-password')).rejects.toMatchObject({ status: 403 });
 	});
 
 	it('logout POSTs /api/auth/logout and always resolves', async () => {

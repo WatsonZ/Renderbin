@@ -33,6 +33,9 @@ type File struct {
 	Kind             string        `json:"kind"`
 	CodeSuccessCount int64         `json:"code_success_count"`
 	UserID           int64         `json:"user_id"`
+	ExpiredAt        sql.NullTime  `json:"expired_at"`
+	ExpiredReason    string        `json:"expired_reason"`
+	ContentSize      int64         `json:"content_size"`
 }
 
 type Session struct {
@@ -50,4 +53,6 @@ type User struct {
 	ApiKey       sql.NullString `json:"api_key"`
 	CreatedAt    time.Time      `json:"created_at"`
 	UpdatedAt    time.Time      `json:"updated_at"`
+	DisabledAt   sql.NullTime   `json:"disabled_at"`
+	QuotaBytes   int64          `json:"quota_bytes"`
 }

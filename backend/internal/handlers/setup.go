@@ -1,7 +1,7 @@
 package handlers
 
 import (
-	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 
@@ -36,8 +36,7 @@ func (h *SetupHandler) Status(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(setupStatusResponse{
+	writeJSON(w, setupStatusResponse{
 		NeedsSetup:        count == 0,
 		AllowRegistration: configBool(r, h.queries, ConfigAllowRegistration),
 	})
@@ -54,30 +53,26 @@ type setupRequest struct {
 // Setup creates the super admin and the initial configs, then logs the new
 // admin in. Only valid while no user exists; afterwards it always 409s.
 func (h *SetupHandler) Setup(w http.ResponseWriter, r *http.Request) {
-	count, err := h.queries.CountUsers(r.Context())
-	if err != nil {
-		h.logger.Error("count users", "error", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	if count > 0 {
-		http.Error(w, "already set up", http.StatusConflict)
-		return
-	}
-
 	var req setupRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	if !decodeSmallJSON(w, r, &req) {
 		return
 	}
 
+	// No count-then-create here: CreateFirstUser only inserts while the users
+	// table is empty, so the "is this the first run" decision happens inside
+	// the write instead of ~80ms of bcrypt before it. Concurrent requests used
+	// to all pass a CountUsers check and create an account each.
 	user, errMsg, err := createUser(r, h.queries, registerRequest{
 		Username: req.Username,
 		Nickname: req.Nickname,
 		Password: req.Password,
-	})
+	}, true)
 	if errMsg != "" {
 		http.Error(w, errMsg, http.StatusBadRequest)
+		return
+	}
+	if errors.Is(err, errFirstUserExists) {
+		http.Error(w, "already set up", http.StatusConflict)
 		return
 	}
 	if err != nil {

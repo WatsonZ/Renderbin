@@ -10,11 +10,15 @@
 	import { t, intlLocale } from '$lib/i18n/index.svelte';
 	import type { MessageKey } from '$lib/i18n/messages';
 	import LanguageSwitcher from '$lib/components/LanguageSwitcher.svelte';
+	import { copyText } from '$lib/clipboard';
+	import { formatSize } from '$lib/format';
+	import { getUsage, type Usage } from '$lib/api/settings';
 	import {
 		ApiError,
 		createFile,
 		deleteFile,
 		deleteFilePermanent,
+		emptyTrash,
 		getFile,
 		listTrashed,
 		refreshCode,
@@ -49,6 +53,22 @@
 	let trashedFiles = $state<FileItem[]>([]);
 	let trashedLoaded = $state(false);
 	let trashLoading = $state(false);
+	let emptyingTrash = $state(false);
+
+	// New-file modal. `kind` is only ever chosen here: the format decides how
+	// /res/{slug} renders the source and is fixed at creation, so the edit modal
+	// offers no way to change it.
+	const kindOptions = [
+		{ key: 'html', labelKey: 'kind.html' },
+		{ key: 'markdown', labelKey: 'kind.markdown' },
+		{ key: 'txt', labelKey: 'kind.txt' }
+	] as const satisfies { key: FileKind; labelKey: MessageKey }[];
+	let createOpen = $state(false);
+	let createName = $state('');
+	let createKind = $state<FileKind>('markdown');
+	let createContent = $state('');
+	let createBusy = $state(false);
+	let createError = $state<string | null>(null);
 
 	const visibilityOptions = [
 		{ key: 'all', labelKey: 'visibility.all' },
@@ -108,6 +128,22 @@
 	let visibilityFilter = $state<'all' | 'public' | 'private'>('all');
 	let copiedSlug = $state<string | null>(null);
 	let copiedTimeout: ReturnType<typeof setTimeout> | undefined;
+	// The URL a copy attempt failed on. Both clipboard paths can be refused
+	// (an old browser on a plain-HTTP LAN, or a denied permission), and a share
+	// link the user cannot reach any other way is worse than an ugly one they
+	// can -- so on failure the row renders it as selectable text instead.
+	let copyFallbackUrl = $state<string | null>(null);
+
+	// Storage use against the account's quota. Fetched separately from the file
+	// list because it counts trashed files too, which is what the server
+	// enforces on upload; summing the visible rows would show a smaller number
+	// than the one that rejects the next upload.
+	let usage = $state<Usage | null>(null);
+	$effect(() => {
+		getUsage()
+			.then((u) => (usage = u))
+			.catch(() => (usage = null));
+	});
 
 	type SortKey = 'recent' | 'name' | 'success' | 'failure';
 	const sortOptions: { key: SortKey; labelKey: MessageKey; defaultDir: 'asc' | 'desc' }[] = [
@@ -139,21 +175,53 @@
 	let editBusy = $state(false);
 	let editError = $state<string | null>(null);
 
-	// Expiry modal.
-	const ttlPresets = [
-		{ key: '24h', labelKey: 'ttl.24h' },
-		{ key: '48h', labelKey: 'ttl.48h' },
-		{ key: '72h', labelKey: 'ttl.72h' },
-		{ key: '7d', labelKey: 'ttl.7d' },
-		{ key: '30d', labelKey: 'ttl.30d' }
+	// Expiry modal. A ttl is an amount plus a unit ("1d", "36h", "6mo"), the
+	// same grammar the API speaks, so the picker is free-form rather than a
+	// fixed preset list.
+	const ttlUnits = [
+		{ key: 'h', labelKey: 'ttl.hours' },
+		{ key: 'd', labelKey: 'ttl.days' },
+		{ key: 'w', labelKey: 'ttl.weeks' },
+		{ key: 'mo', labelKey: 'ttl.months' },
+		{ key: 'y', labelKey: 'ttl.years' }
 	] as const satisfies { key: string; labelKey: MessageKey }[];
+	type TtlUnit = (typeof ttlUnits)[number]['key'];
+	// Mirrors handlers.maxTTLYears — the client-side check exists only to give
+	// a better message than the server's 400; the server still decides.
+	const MAX_TTL_YEARS = 10;
 	let expiryOpen = $state(false);
 	let expiryFile = $state<FileItem | null>(null);
 	let expiryMode = $state<'none' | 'time' | 'views'>('none');
-	let expiryTtl = $state<string>('24h');
+	let expiryTtlValue = $state<number>(1);
+	let expiryTtlUnit = $state<TtlUnit>('d');
 	let expiryViews = $state<number>(10);
 	let expiryBusy = $state(false);
 	let expiryError = $state<string | null>(null);
+
+	// Stamped when the modal opens so the preview below is computed from one
+	// fixed "now" rather than drifting between keystrokes.
+	let expiryNow = $state(0);
+
+	// The deadline the current amount/unit would produce, for the preview line
+	// under the picker. Calendar units step the calendar (a month later is the
+	// same day of the next month), matching the server's AddDate arithmetic.
+	// null means "the server would reject this", i.e. nothing to preview.
+	function ttlDeadline(value: number, unit: TtlUnit, base: number): Date | null {
+		if (!Number.isInteger(value) || value <= 0) return null;
+		const d = new Date(base);
+		if (unit === 'h') d.setHours(d.getHours() + value);
+		else if (unit === 'd') d.setDate(d.getDate() + value);
+		else if (unit === 'w') d.setDate(d.getDate() + value * 7);
+		else if (unit === 'mo') d.setMonth(d.getMonth() + value);
+		else d.setFullYear(d.getFullYear() + value);
+		const cap = new Date(base);
+		cap.setFullYear(cap.getFullYear() + MAX_TTL_YEARS);
+		return d > cap ? null : d;
+	}
+
+	const expiryPreview = $derived(
+		expiryMode === 'time' ? ttlDeadline(expiryTtlValue, expiryTtlUnit, expiryNow) : null
+	);
 
 	let tagInputSlug = $state<string | null>(null);
 	let tagInputValue = $state('');
@@ -257,12 +325,31 @@
 		return new Date(iso).toLocaleTimeString(intlLocale(), { hour: '2-digit', minute: '2-digit' });
 	}
 
+	// A file's expiry deadline, to the minute — a link that dies at 18:00 today
+	// and one that dies at 06:00 today are not the same thing, so the row shows
+	// the time and not just the date. The year is left off unless it differs
+	// from the current one, same as dayLabel.
+	function formatDeadline(iso: string): string {
+		const d = new Date(iso);
+		return d.toLocaleString(intlLocale(), {
+			year: d.getFullYear() !== new Date().getFullYear() ? 'numeric' : undefined,
+			month: 'short',
+			day: 'numeric',
+			hour: '2-digit',
+			minute: '2-digit'
+		});
+	}
+
 	function resUrl(file: FileItem): string {
 		return `${location.origin}/res/${file.slug}?code=${file.access_code}`;
 	}
 
 	async function copyToClipboard(text: string, slug: string) {
-		await navigator.clipboard.writeText(text);
+		copyFallbackUrl = null;
+		if (!(await copyText(text))) {
+			copyFallbackUrl = text;
+			return;
+		}
 		copiedSlug = slug;
 		clearTimeout(copiedTimeout);
 		copiedTimeout = setTimeout(() => (copiedSlug = null), 1500);
@@ -420,6 +507,67 @@
 		}
 	}
 
+	async function onEmptyTrash() {
+		if (trashedFiles.length === 0 || emptyingTrash) return;
+		if (!confirm(t('confirm.emptyTrash', { n: trashedFiles.length }))) return;
+		errorMessage = null;
+		emptyingTrash = true;
+		try {
+			await emptyTrash();
+			trashedFiles = [];
+			await refreshUsage();
+		} catch (err) {
+			errorMessage = err instanceof Error ? err.message : t('error.emptyTrash');
+		} finally {
+			emptyingTrash = false;
+		}
+	}
+
+	function openCreate() {
+		createName = '';
+		createKind = 'markdown';
+		createContent = '';
+		createError = null;
+		createOpen = true;
+	}
+
+	function closeCreate() {
+		createOpen = false;
+	}
+
+	async function submitCreate() {
+		if (!createContent) {
+			createError = t('error.contentRequired');
+			return;
+		}
+		if (new Blob([createContent]).size > MAX_HTML_BYTES) {
+			createError = t('error.contentTooLarge');
+			return;
+		}
+		createError = null;
+		createBusy = true;
+		try {
+			const created = await createFile(
+				createName.trim() || t('untitled'),
+				createContent,
+				createKind
+			);
+			files = [created, ...files];
+			await refreshUsage();
+			// A new file lands at the top of "Recent"; leaving a search or a
+			// visibility filter on would hide it and read as a failed create.
+			search = '';
+			searchResults = null;
+			visibilityFilter = 'all';
+			tab = 'files';
+			closeCreate();
+		} catch (err) {
+			createError = err instanceof Error ? err.message : t('error.create');
+		} finally {
+			createBusy = false;
+		}
+	}
+
 	async function onRestore(file: FileItem) {
 		errorMessage = null;
 		try {
@@ -503,9 +651,13 @@
 
 	function openExpiry(file: FileItem) {
 		expiryFile = file;
+		expiryNow = Date.now();
 		if (file.expires_at) {
+			// Only the deadline is stored, not the amount/unit it came from, so
+			// the picker resets to the default rather than guessing.
 			expiryMode = 'time';
-			expiryTtl = '24h';
+			expiryTtlValue = 1;
+			expiryTtlUnit = 'd';
 		} else if (file.max_views != null) {
 			expiryMode = 'views';
 			expiryViews = file.max_views;
@@ -525,7 +677,11 @@
 		if (!expiryFile) return;
 		let payload: { ttl?: string | null; max_views?: number | null };
 		if (expiryMode === 'time') {
-			payload = { ttl: expiryTtl };
+			if (!ttlDeadline(expiryTtlValue, expiryTtlUnit, expiryNow)) {
+				expiryError = t('error.ttlValue', { years: MAX_TTL_YEARS });
+				return;
+			}
+			payload = { ttl: `${expiryTtlValue}${expiryTtlUnit}` };
 		} else if (expiryMode === 'views') {
 			if (!Number.isInteger(expiryViews) || expiryViews <= 0) {
 				expiryError = t('error.viewCount');
@@ -642,6 +798,9 @@
 	}
 
 	async function onRefreshCode(file: FileItem) {
+		// Every link already shared for this file stops working the moment this
+		// succeeds, and there is no undo -- the old code is gone.
+		if (!confirm(t('confirm.refreshCode', { name: file.name }))) return;
 		errorMessage = null;
 		try {
 			const updated = await refreshCode(file.slug);
@@ -657,8 +816,27 @@
 		try {
 			await deleteFile(file.slug);
 			files = files.filter((f) => f.slug !== file.slug);
+			// Move it into the trash list too. Without this the tab kept whatever
+			// it fetched the first time it was opened (trashedLoaded latches), so
+			// a file deleted afterwards was missing from both lists and looked
+			// like a soft delete had destroyed it.
+			if (trashedLoaded) {
+				trashedFiles = [file, ...trashedFiles];
+			}
+			await refreshUsage();
 		} catch (err) {
 			errorMessage = err instanceof Error ? err.message : t('error.delete');
+		}
+	}
+
+	// Stored bytes changed, so the quota readout has to catch up. Failures are
+	// ignored: a stale number is not worth an error banner over the action the
+	// user actually asked for, and the next successful call corrects it.
+	async function refreshUsage() {
+		try {
+			usage = await getUsage();
+		} catch {
+			/* keep the previous figure */
 		}
 	}
 
@@ -668,6 +846,7 @@
 		try {
 			await deleteFilePermanent(file.slug);
 			trashedFiles = trashedFiles.filter((f) => f.slug !== file.slug);
+			await refreshUsage();
 		} catch (err) {
 			errorMessage = err instanceof Error ? err.message : t('error.deletePermanent');
 		}
@@ -713,23 +892,30 @@
 				<span class="text-base font-semibold tracking-tight">Renderbin</span>
 			</div>
 
+			<!-- Deliberately just three items. Account management and
+			     backup/restore are super-admin-only sections of /settings rather
+			     than top-bar buttons: they are rare, consequential operations, and
+			     a bar that changes shape depending on who is signed in is worse
+			     than one place to look for everything administrative. -->
 			<div class="flex items-center gap-4">
-				<LanguageSwitcher />
-				<!-- The snapshot is the whole database, so /api/backup is super-admin
-				     only and 403s for everyone else; don't offer a button that fails. -->
-				{#if data.user?.is_admin}
-					<!-- eslint-disable svelte/no-navigation-without-resolve -- /api/backup is served by the Go backend, not a SvelteKit route -->
-					<a
-						href="/api/backup"
-						download
-						title={t('header.backupTitle')}
-						class="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm text-neutral-400 transition-colors hover:bg-neutral-800 hover:text-neutral-100"
+				<!-- The signed-in account. On a multi-user instance there was
+				     otherwise no way to tell which one you were in without
+				     opening settings. Nickname, not username: it is the name the
+				     user chose to be called, and the username is a login
+				     credential with no reason to be on every screen. -->
+				<!-- The layout guard redirects to /login before this page renders
+				     without a user, so the guard here is for the type, not a case
+				     that occurs. -->
+				{#if data.user}
+					<span
+						class="hidden items-center gap-1.5 text-sm text-neutral-400 sm:flex"
+						title={data.user.nickname}
 					>
-						<Icon icon="lucide:database-backup" width="15" height="15" />
-						{t('header.backup')}
-					</a>
-					<!-- eslint-enable svelte/no-navigation-without-resolve -->
+						<Icon icon="lucide:user" width="15" height="15" />
+						<span class="max-w-32 truncate">{data.user.nickname}</span>
+					</span>
 				{/if}
+				<LanguageSwitcher />
 				<a
 					href={resolve('/settings')}
 					class="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm text-neutral-400 transition-colors hover:bg-neutral-800 hover:text-neutral-100"
@@ -785,10 +971,44 @@
 						{t('count.inTrash', { n: trashedFiles.length })}
 					</p>
 				{/if}
+				{#if usage}
+					<p class="mt-1 font-mono text-xs text-neutral-600">
+						{t('quota.used', {
+							used: formatSize(usage.used_bytes),
+							quota: formatSize(usage.quota_bytes)
+						})}
+					</p>
+				{/if}
 			</div>
 
 			<div class="flex flex-col items-end gap-1.5">
 				<div class="flex items-center gap-2">
+					{#if tab === 'trashed'}
+						<button
+							onclick={onEmptyTrash}
+							disabled={emptyingTrash || trashedFiles.length === 0}
+							title={t('trash.emptyAllTitle')}
+							class="flex items-center gap-2 rounded-lg bg-neutral-800 px-4 py-2 text-sm font-medium
+								text-neutral-200 transition-colors hover:bg-red-500/10 hover:text-red-400
+								disabled:cursor-not-allowed disabled:opacity-40"
+						>
+							<Icon
+								icon={emptyingTrash ? 'lucide:loader-2' : 'lucide:trash-2'}
+								width="16"
+								height="16"
+								class={emptyingTrash ? 'animate-spin' : ''}
+							/>
+							{t('trash.emptyAll')}
+						</button>
+					{/if}
+					<button
+						onclick={openCreate}
+						class="flex items-center gap-2 rounded-lg bg-neutral-800 px-4 py-2 text-sm font-medium
+							text-neutral-200 transition-colors hover:bg-neutral-700"
+					>
+						<Icon icon="lucide:file-plus-2" width="16" height="16" />
+						{t('create.button')}
+					</button>
 					<button
 						onclick={() => fileInput?.click()}
 						disabled={uploading}
@@ -822,6 +1042,36 @@
 			>
 				<Icon icon="lucide:alert-circle" width="16" height="16" class="shrink-0" />
 				{errorMessage}
+			</div>
+		{/if}
+
+		<!-- Shown when the browser refused both clipboard paths. The input is
+		     auto-selected so the link is one Ctrl+C away; without it the URL
+		     appears nowhere on the page and the user has to open the file just
+		     to read it out of the address bar. -->
+		{#if copyFallbackUrl}
+			<div
+				class="flex flex-wrap items-center gap-2 rounded-lg border border-amber-900/50 bg-amber-500/10 px-3 py-2 text-sm text-amber-300"
+			>
+				<Icon icon="lucide:clipboard-x" width="16" height="16" class="shrink-0" />
+				<span>{t('copy.failed')}</span>
+				<!-- svelte-ignore a11y_autofocus -->
+				<input
+					type="text"
+					readonly
+					autofocus
+					value={copyFallbackUrl}
+					onfocus={(e) => e.currentTarget.select()}
+					class="min-w-0 flex-1 rounded border border-amber-900/50 bg-neutral-950 px-2 py-1 font-mono text-xs text-amber-200"
+				/>
+				<button
+					onclick={() => (copyFallbackUrl = null)}
+					aria-label={t('copy.dismiss')}
+					title={t('copy.dismiss')}
+					class="rounded p-1 text-amber-400/70 transition-colors hover:bg-amber-500/10 hover:text-amber-300"
+				>
+					<Icon icon="lucide:x" width="14" height="14" />
+				</button>
 			</div>
 		{/if}
 
@@ -993,6 +1243,7 @@
 							>
 								{kindLabel(file.kind)}
 							</span>
+							<span class="font-mono" title={t('row.sizeTitle')}>{formatSize(file.size)}</span>
 							<span title={new Date(file.created_at).toLocaleString(intlLocale())}>
 								{formatTime(file.created_at)}
 							</span>
@@ -1009,9 +1260,7 @@
 									})}
 								>
 									<Icon icon="lucide:clock" width="12" height="12" />
-									{t('row.expires', {
-										date: new Date(file.expires_at).toLocaleDateString(intlLocale())
-									})}
+									{t('row.expires', { datetime: formatDeadline(file.expires_at) })}
 								</span>
 							{/if}
 							{#if file.max_views != null}
@@ -1021,6 +1270,23 @@
 								>
 									<Icon icon="lucide:eye" width="12" height="12" />
 									{t('row.viewsLeft', { n: Math.max(0, file.max_views - (file.view_count ?? 0)) })}
+								</span>
+							{/if}
+							<!-- Why this link stopped working. Expiring clears the limit
+							     columns, so without this the row could only say "private"
+							     and the owner couldn't tell an expired link from one they
+							     made private themselves. Shown only while the file is
+							     still private: re-publishing it makes the note stale, and
+							     setting a new limit clears it server-side. -->
+							{#if !file.is_public && file.expired_reason}
+								<span
+									class="flex items-center gap-1 rounded bg-red-500/10 px-1.5 py-0.5 text-red-400"
+									title={t('row.expiredTitle', {
+										datetime: new Date(file.expired_at ?? '').toLocaleString(intlLocale())
+									})}
+								>
+									<Icon icon="lucide:circle-slash" width="12" height="12" />
+									{file.expired_reason === 'ttl' ? t('row.expiredTtl') : t('row.expiredViews')}
 								</span>
 							{/if}
 							<span class="flex items-center gap-1 rounded bg-neutral-800 py-0.5 pr-1 pl-1.5">
@@ -1279,9 +1545,110 @@
 		if (e.key === 'Escape') {
 			if (editOpen) closeEdit();
 			if (expiryOpen) closeExpiry();
+			if (createOpen && !createBusy) closeCreate();
 		}
 	}}
 />
+
+{#if createOpen}
+	<div
+		class="fixed inset-0 z-30 flex items-center justify-center bg-neutral-950/70 p-4 backdrop-blur-sm"
+		onclick={() => !createBusy && closeCreate()}
+		role="presentation"
+	>
+		<div
+			class="flex max-h-[90vh] w-full max-w-2xl flex-col gap-4 rounded-2xl border border-neutral-800 bg-neutral-900 p-6 shadow-2xl"
+			onclick={(e) => e.stopPropagation()}
+			role="presentation"
+		>
+			<div class="flex items-center justify-between">
+				<h2 class="text-lg font-semibold tracking-tight">{t('create.title')}</h2>
+				<button
+					onclick={closeCreate}
+					disabled={createBusy}
+					class="rounded-lg p-1 text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-200"
+				>
+					<Icon icon="lucide:x" width="18" height="18" />
+				</button>
+			</div>
+
+			<label class="flex flex-col gap-1 text-xs font-medium text-neutral-400">
+				{t('create.nameLabel')}
+				<input
+					bind:value={createName}
+					use:autofocus
+					placeholder={t('untitled')}
+					class="rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 outline-none focus:border-emerald-500"
+				/>
+			</label>
+
+			<div class="flex flex-col gap-1">
+				<span class="text-xs font-medium text-neutral-400">{t('create.kindLabel')}</span>
+				<div
+					role="group"
+					aria-label={t('create.kindLabel')}
+					class="flex w-fit items-center gap-0.5 rounded-lg border border-neutral-800 bg-neutral-950 p-0.5"
+				>
+					{#each kindOptions as opt (opt.key)}
+						<button
+							onclick={() => (createKind = opt.key)}
+							aria-pressed={createKind === opt.key}
+							class={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+								createKind === opt.key
+									? 'bg-emerald-500 text-neutral-950'
+									: 'text-neutral-400 hover:bg-neutral-800 hover:text-neutral-200'
+							}`}
+						>
+							<Icon icon={kindIcon(opt.key)} width="13" height="13" />
+							{t(opt.labelKey)}
+						</button>
+					{/each}
+				</div>
+				<p class="text-xs text-neutral-600">{t('create.kindHint')}</p>
+			</div>
+
+			<label class="flex min-h-0 flex-col gap-1 text-xs font-medium text-neutral-400">
+				{t('create.contentLabel')}
+				<textarea
+					bind:value={createContent}
+					spellcheck="false"
+					placeholder={t('create.contentPlaceholder')}
+					class="min-h-[240px] flex-1 resize-none rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 font-mono text-xs text-neutral-100 placeholder-neutral-600 outline-none focus:border-emerald-500"
+				></textarea>
+			</label>
+
+			{#if createError}
+				<div
+					role="alert"
+					class="flex items-center gap-2 rounded-lg border border-red-900/50 bg-red-500/10 px-3 py-2 text-sm text-red-400"
+				>
+					<Icon icon="lucide:alert-circle" width="16" height="16" class="shrink-0" />
+					{createError}
+				</div>
+			{/if}
+
+			<div class="flex justify-end gap-2">
+				<button
+					onclick={closeCreate}
+					disabled={createBusy}
+					class="rounded-lg px-4 py-2 text-sm font-medium text-neutral-400 transition-colors hover:bg-neutral-800 hover:text-neutral-100 disabled:opacity-50"
+				>
+					{t('common.cancel')}
+				</button>
+				<button
+					onclick={submitCreate}
+					disabled={createBusy}
+					class="flex items-center gap-2 rounded-lg bg-emerald-500 px-4 py-2 text-sm font-medium text-neutral-950 transition-colors hover:bg-emerald-400 disabled:opacity-50"
+				>
+					{#if createBusy}
+						<Icon icon="lucide:loader-2" width="15" height="15" class="animate-spin" />
+					{/if}
+					{createBusy ? t('create.creating') : t('create.submit')}
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}
 
 {#if editOpen}
 	<div
@@ -1428,19 +1795,37 @@
 				<div class="flex flex-col gap-1.5">
 					<span class="text-xs font-medium text-neutral-400">{t('expiry.expiresAfter')}</span>
 					<div class="flex flex-wrap items-center gap-1.5">
-						{#each ttlPresets as preset (preset.key)}
-							<button
-								onclick={() => (expiryTtl = preset.key)}
-								class={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
-									expiryTtl === preset.key
-										? 'bg-neutral-100 text-neutral-950'
-										: 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'
-								}`}
-							>
-								{t(preset.labelKey)}
-							</button>
-						{/each}
+						<input
+							type="number"
+							min="1"
+							step="1"
+							bind:value={expiryTtlValue}
+							class="w-20 rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-100 outline-none focus:border-emerald-500"
+						/>
+						<div class="flex flex-wrap items-center gap-1.5">
+							{#each ttlUnits as unit (unit.key)}
+								<button
+									onclick={() => (expiryTtlUnit = unit.key)}
+									class={`rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+										expiryTtlUnit === unit.key
+											? 'bg-neutral-100 text-neutral-950'
+											: 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'
+									}`}
+								>
+									{t(unit.labelKey)}
+								</button>
+							{/each}
+						</div>
 					</div>
+					<!-- The deadline in plain words: "1 month" is easy to pick and hard
+					     to picture, and this is the number the owner has to plan around. -->
+					<p class="text-xs text-neutral-500">
+						{#if expiryPreview}
+							{t('expiry.preview', { datetime: expiryPreview.toLocaleString(intlLocale()) })}
+						{:else}
+							{t('error.ttlValue', { years: MAX_TTL_YEARS })}
+						{/if}
+					</p>
 				</div>
 			{:else if expiryMode === 'views'}
 				<label class="flex flex-col gap-1.5 text-xs font-medium text-neutral-400">

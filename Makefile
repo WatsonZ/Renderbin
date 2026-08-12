@@ -30,8 +30,14 @@ build-api:
 
 build: build-web build-api
 
+# Must stay a superset of what .github/workflows/ci.yml runs on a PR --
+# `pnpm run lint` (prettier --check + eslint) belongs here for that reason. It
+# was missing, so a contributor could get `make check` green, be told by the
+# README that this is the bar, and still fail CI on formatting alone.
 check:
+	cd web && pnpm run lint
 	cd web && pnpm run check
+	cd backend && gofmt -l . | tee /dev/stderr | (! read)
 	cd backend && go vet ./...
 
 sqlc:

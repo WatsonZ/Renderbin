@@ -22,8 +22,36 @@ func newQueries(t *testing.T) *sqlcgen.Queries {
 	return sqlcgen.New(conn)
 }
 
+// ensureUser returns the named user, creating it on first use. Tests that only
+// care about files still need real owner rows: GetFileBySlugAnyOwner joins
+// users to hide a suspended owner's files, so a file whose user_id points at
+// nothing is invisible on the public render path.
+func ensureUser(t *testing.T, q *sqlcgen.Queries, username string) sqlcgen.User {
+	t.Helper()
+	ctx := context.Background()
+	if u, err := q.GetUserByUsername(ctx, username); err == nil {
+		return u
+	}
+	u, err := q.CreateUser(ctx, sqlcgen.CreateUserParams{
+		Username:     username,
+		Nickname:     username,
+		PasswordHash: "hash-" + username,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser(%q): %v", username, err)
+	}
+	return u
+}
+
+// createFile inserts a file owned by user 1, seeding that user if needed. The
+// id assertion catches a test that created some other user first: ids are
+// handed out in insertion order, so that would silently attribute these files
+// to the wrong account and make an isolation assertion pass vacuously.
 func createFile(t *testing.T, q *sqlcgen.Queries, slug string) sqlcgen.File {
 	t.Helper()
+	if owner := ensureUser(t, q, "owner"); owner.ID != 1 {
+		t.Fatalf("createFile's owner has id %d, not 1 -- create it before any other user", owner.ID)
+	}
 	f, err := q.CreateFile(context.Background(), sqlcgen.CreateFileParams{
 		Slug:        slug,
 		Name:        "name-" + slug,
@@ -82,7 +110,7 @@ func TestListFilesVsDeleted(t *testing.T) {
 		t.Fatalf("ListUserFiles: %v", err)
 	}
 	if len(active) != 1 || active[0].Slug != "keep" {
-		t.Errorf("ListUserFiles = %v, want only [keep]", slugsOf(active))
+		t.Errorf("ListUserFiles = %v, want only [keep]", activeSlugs(active))
 	}
 
 	deleted, err := q.ListUserDeletedFiles(ctx, 1)
@@ -90,7 +118,7 @@ func TestListFilesVsDeleted(t *testing.T) {
 		t.Fatalf("ListUserDeletedFiles: %v", err)
 	}
 	if len(deleted) != 1 || deleted[0].Slug != "trash" {
-		t.Errorf("ListUserDeletedFiles = %v, want only [trash]", slugsOf(deleted))
+		t.Errorf("ListUserDeletedFiles = %v, want only [trash]", trashSlugs(deleted))
 	}
 }
 
@@ -224,7 +252,7 @@ func TestExpireFileGoesPrivateAndClearsLimits(t *testing.T) {
 		t.Fatalf("SetFileExpiry: %v", err)
 	}
 
-	if err := q.ExpireFile(ctx, "a"); err != nil {
+	if err := q.ExpireFile(ctx, sqlcgen.ExpireFileParams{ExpiredReason: "ttl", Slug: "a"}); err != nil {
 		t.Fatalf("ExpireFile: %v", err)
 	}
 	got, err := q.GetFileBySlugAnyOwner(ctx, "a")
@@ -236,6 +264,145 @@ func TestExpireFileGoesPrivateAndClearsLimits(t *testing.T) {
 	}
 	if got.ExpiresAt.Valid || got.MaxViews.Valid {
 		t.Error("expired file should have its limit columns cleared")
+	}
+	if got.ExpiredReason != "ttl" || !got.ExpiredAt.Valid {
+		t.Errorf("expiry marker = %q at %v, want ttl with a timestamp", got.ExpiredReason, got.ExpiredAt)
+	}
+
+	// A second event overwrites the first: the marker is the *last* reason,
+	// never a history.
+	if err := q.ExpireFile(ctx, sqlcgen.ExpireFileParams{ExpiredReason: "views", Slug: "a"}); err != nil {
+		t.Fatalf("ExpireFile (again): %v", err)
+	}
+	if got, err = q.GetFileBySlugAnyOwner(ctx, "a"); err != nil {
+		t.Fatalf("GetFileBySlugAnyOwner: %v", err)
+	}
+	if got.ExpiredReason != "views" {
+		t.Errorf("expiry marker = %q, want the latest reason (views)", got.ExpiredReason)
+	}
+
+	// Configuring a new limit clears it, so the badge can never contradict a
+	// live expiry sitting next to it.
+	if _, err := q.SetFileExpiry(ctx, sqlcgen.SetFileExpiryParams{
+		MaxViews: sql.NullInt64{Int64: 3, Valid: true}, Slug: "a", UserID: 1,
+	}); err != nil {
+		t.Fatalf("SetFileExpiry: %v", err)
+	}
+	if got, err = q.GetFileBySlugAnyOwner(ctx, "a"); err != nil {
+		t.Fatalf("GetFileBySlugAnyOwner: %v", err)
+	}
+	if got.ExpiredReason != "" || got.ExpiredAt.Valid {
+		t.Errorf("expiry marker = %q at %v, want cleared by a new limit", got.ExpiredReason, got.ExpiredAt)
+	}
+}
+
+// TestSuspendedOwnerHidesFiles pins the SQL half of account suspension: the
+// public render path must stop finding a suspended user's files, and finding
+// them again is exactly what un-suspending means.
+func TestSuspendedOwnerHidesFiles(t *testing.T) {
+	q := newQueries(t)
+	ctx := context.Background()
+	f := createFile(t, q, "a")
+
+	if _, err := q.GetFileBySlugAnyOwner(ctx, f.Slug); err != nil {
+		t.Fatalf("file should be visible while its owner is active: %v", err)
+	}
+
+	if _, err := q.DisableUser(ctx, f.UserID); err != nil {
+		t.Fatalf("DisableUser: %v", err)
+	}
+	if _, err := q.GetFileBySlugAnyOwner(ctx, f.Slug); !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("suspended owner's file err = %v, want ErrNoRows so /res/{slug} 404s", err)
+	}
+	// The owner-scoped read is untouched: suspension is enforced on the
+	// identity (CurrentUser) for authenticated paths, not by hiding rows.
+	if _, err := q.GetUserFileBySlug(ctx, sqlcgen.GetUserFileBySlugParams{
+		Slug: f.Slug, UserID: f.UserID,
+	}); err != nil {
+		t.Errorf("owner-scoped read err = %v, want the row to still exist", err)
+	}
+
+	if _, err := q.EnableUser(ctx, f.UserID); err != nil {
+		t.Fatalf("EnableUser: %v", err)
+	}
+	if _, err := q.GetFileBySlugAnyOwner(ctx, f.Slug); err != nil {
+		t.Errorf("file should be visible again after un-suspending: %v", err)
+	}
+}
+
+func TestHardDeleteUserTrash(t *testing.T) {
+	q := newQueries(t)
+	ctx := context.Background()
+	createFile(t, q, "keep")
+	createFile(t, q, "trash1")
+	createFile(t, q, "trash2")
+	stranger := ensureUser(t, q, "stranger")
+	if _, err := q.CreateFile(ctx, sqlcgen.CreateFileParams{
+		Slug: "theirs", Name: "theirs", HtmlContent: "<p>x</p>", Kind: "html",
+		AccessCode: "c", UserID: stranger.ID,
+	}); err != nil {
+		t.Fatalf("CreateFile(theirs): %v", err)
+	}
+	for _, slug := range []string{"trash1", "trash2"} {
+		if _, err := q.SoftDeleteFile(ctx, sqlcgen.SoftDeleteFileParams{Slug: slug, UserID: 1}); err != nil {
+			t.Fatalf("SoftDeleteFile(%q): %v", slug, err)
+		}
+	}
+	if _, err := q.SoftDeleteFile(ctx, sqlcgen.SoftDeleteFileParams{Slug: "theirs", UserID: stranger.ID}); err != nil {
+		t.Fatalf("SoftDeleteFile(theirs): %v", err)
+	}
+
+	rows, err := q.HardDeleteUserTrash(ctx, 1)
+	if err != nil {
+		t.Fatalf("HardDeleteUserTrash: %v", err)
+	}
+	if rows != 2 {
+		t.Errorf("deleted %d rows, want 2", rows)
+	}
+	// The live file survives -- this is the only unbounded delete in the query
+	// file, so "it only took the trash" is the property worth pinning.
+	if _, err := q.GetFileBySlugAnyOwner(ctx, "keep"); err != nil {
+		t.Errorf("live file was purged with the trash: %v", err)
+	}
+	// And it is scoped: the stranger's trash is untouched.
+	theirs, err := q.ListUserDeletedFiles(ctx, stranger.ID)
+	if err != nil {
+		t.Fatalf("ListUserDeletedFiles: %v", err)
+	}
+	if len(theirs) != 1 {
+		t.Errorf("stranger's trash = %v, want their own file left alone", trashSlugs(theirs))
+	}
+
+	// Emptying an empty trash is a no-op, not an error.
+	if rows, err = q.HardDeleteUserTrash(ctx, 1); err != nil || rows != 0 {
+		t.Errorf("second empty = %d rows, %v; want 0, nil", rows, err)
+	}
+}
+
+func TestListUsersWithFileCounts(t *testing.T) {
+	q := newQueries(t)
+	ctx := context.Background()
+	createFile(t, q, "a")
+	createFile(t, q, "b")
+	if _, err := q.SoftDeleteFile(ctx, sqlcgen.SoftDeleteFileParams{Slug: "b", UserID: 1}); err != nil {
+		t.Fatalf("SoftDeleteFile: %v", err)
+	}
+	// A user with no files at all must still appear, which is why the counts
+	// are correlated subqueries rather than a join.
+	ensureUser(t, q, "empty")
+
+	rows, err := q.ListUsersWithFileCounts(ctx)
+	if err != nil {
+		t.Fatalf("ListUsersWithFileCounts: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d users, want 2", len(rows))
+	}
+	if rows[0].FileCount != 1 || rows[0].TrashedCount != 1 {
+		t.Errorf("owner counts = %d active / %d trashed, want 1 / 1", rows[0].FileCount, rows[0].TrashedCount)
+	}
+	if rows[1].FileCount != 0 || rows[1].TrashedCount != 0 {
+		t.Errorf("file-less user counts = %d / %d, want 0 / 0", rows[1].FileCount, rows[1].TrashedCount)
 	}
 }
 
@@ -269,20 +436,24 @@ func TestSessionLifecycle(t *testing.T) {
 	q := newQueries(t)
 	ctx := context.Background()
 
-	// Use a margin larger than any timezone offset: the driver stores the
-	// wall-clock time and GetValidSession compares it against UTC
-	// CURRENT_TIMESTAMP, so ±1h would be ambiguous under a skewed TZ.
+	// A one-minute margin on purpose. This used to need hours: the driver wrote
+	// local wall-clock time while GetValidSession compared it against UTC
+	// CURRENT_TIMESTAMP as text, so validity was skewed by the host's offset and
+	// a tight margin failed anywhere but UTC. Both sides now go through
+	// unixepoch(), which makes the comparison an instant-to-instant one -- so a
+	// minute is enough, and this test fails if that regresses in a machine
+	// whose TZ isn't UTC.
 	if err := q.CreateSession(ctx, sqlcgen.CreateSessionParams{
 		Token:     "valid",
 		UserID:    1,
-		ExpiresAt: time.Now().Add(48 * time.Hour),
+		ExpiresAt: time.Now().Add(time.Minute),
 	}); err != nil {
 		t.Fatalf("CreateSession(valid): %v", err)
 	}
 	if err := q.CreateSession(ctx, sqlcgen.CreateSessionParams{
 		Token:     "expired",
 		UserID:    1,
-		ExpiresAt: time.Now().Add(-48 * time.Hour),
+		ExpiresAt: time.Now().Add(-time.Minute),
 	}); err != nil {
 		t.Fatalf("CreateSession(expired): %v", err)
 	}
@@ -348,10 +519,37 @@ func TestUserLifecycle(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpdateUserNickname: %v", err)
 	}
-	if err := q.UpdateUserPassword(ctx, sqlcgen.UpdateUserPasswordParams{
+	if rows, err := q.UpdateUserPassword(ctx, sqlcgen.UpdateUserPasswordParams{
 		PasswordHash: "hash2", ID: first.ID,
-	}); err != nil {
-		t.Fatalf("UpdateUserPassword: %v", err)
+	}); err != nil || rows != 1 {
+		t.Fatalf("UpdateUserPassword = %d rows, %v; want 1, nil", rows, err)
+	}
+	// The admin reset path distinguishes "changed it" from "no such user" by
+	// this count, so an unknown id must report zero rather than succeed.
+	if rows, err := q.UpdateUserPassword(ctx, sqlcgen.UpdateUserPasswordParams{
+		PasswordHash: "hash3", ID: 9999,
+	}); err != nil || rows != 0 {
+		t.Errorf("UpdateUserPassword(unknown id) = %d rows, %v; want 0, nil", rows, err)
+	}
+
+	// Suspension round-trip, including the COALESCE that keeps the original
+	// timestamp when an already-suspended account is suspended again.
+	disabled, err := q.DisableUser(ctx, first.ID)
+	if err != nil || !disabled.DisabledAt.Valid {
+		t.Fatalf("DisableUser = %+v, %v", disabled, err)
+	}
+	again, err := q.DisableUser(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("DisableUser (repeat): %v", err)
+	}
+	if !again.DisabledAt.Time.Equal(disabled.DisabledAt.Time) {
+		t.Errorf("re-suspending moved disabled_at from %v to %v", disabled.DisabledAt.Time, again.DisabledAt.Time)
+	}
+	if enabled, err := q.EnableUser(ctx, first.ID); err != nil || enabled.DisabledAt.Valid {
+		t.Errorf("EnableUser = %+v, %v; want disabled_at cleared", enabled, err)
+	}
+	if _, err := q.DisableUser(ctx, 9999); !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("DisableUser(unknown id) err = %v, want ErrNoRows", err)
 	}
 	if err := q.SetUserAPIKey(ctx, sqlcgen.SetUserAPIKeyParams{
 		ApiKey: sql.NullString{String: "rb_abc", Valid: true}, ID: first.ID,
@@ -387,10 +585,20 @@ func TestConfigSetOverwrites(t *testing.T) {
 	}
 }
 
-func slugsOf(files []sqlcgen.File) []string {
-	out := make([]string, len(files))
-	for i, f := range files {
-		out[i] = f.Slug
+// The two listings select an explicit column set rather than *, so sqlc emits
+// a distinct row type for each and one helper cannot serve both.
+func activeSlugs(rows []sqlcgen.ListUserFilesRow) []string {
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		out[i] = r.Slug
+	}
+	return out
+}
+
+func trashSlugs(rows []sqlcgen.ListUserDeletedFilesRow) []string {
+	out := make([]string, len(rows))
+	for i, r := range rows {
+		out[i] = r.Slug
 	}
 	return out
 }
@@ -521,7 +729,7 @@ func TestFileQueriesRejectForeignOwner(t *testing.T) {
 				t.Fatalf("ListUserDeletedFiles: %v", err)
 			}
 			if len(rows) != 1 || rows[0].Slug != "a" {
-				t.Errorf("owner's trash = %v, want [a]", slugsOf(rows))
+				t.Errorf("owner's trash = %v, want [a]", trashSlugs(rows))
 			}
 		})
 	}

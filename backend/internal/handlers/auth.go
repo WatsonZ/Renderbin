@@ -2,13 +2,14 @@ package handlers
 
 import (
 	"database/sql"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/shawn-bluce/renderbin/backend/internal/auth"
 	"github.com/shawn-bluce/renderbin/backend/internal/db/sqlcgen"
@@ -37,7 +38,9 @@ func boolString(b bool) string {
 // usernamePattern keeps usernames short and unambiguous; nicknames are free-form.
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
-const minPasswordLen = 6
+// The password policy lives in internal/auth, shared with the reset-password
+// CLI subcommand; this alias keeps the call sites in this package short.
+const minPasswordLen = auth.MinPasswordLen
 
 type AuthHandler struct {
 	queries *sqlcgen.Queries
@@ -55,8 +58,7 @@ type loginRequest struct {
 
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	if !decodeSmallJSON(w, r, &req) {
 		return
 	}
 
@@ -75,6 +77,13 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 	if !auth.VerifyPassword(user.PasswordHash, req.Password) {
 		http.Error(w, "invalid username or password", http.StatusUnauthorized)
+		return
+	}
+	// Reported only *after* the password checks out, so this stays a message
+	// for the account's owner rather than an oracle telling an attacker which
+	// usernames exist -- the same reason BurnPasswordCheck exists above.
+	if user.DisabledAt.Valid {
+		http.Error(w, "account is disabled", http.StatusForbidden)
 		return
 	}
 
@@ -110,12 +119,11 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req registerRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	if !decodeSmallJSON(w, r, &req) {
 		return
 	}
 
-	user, errMsg, err := createUser(r, h.queries, req)
+	user, errMsg, err := createUser(r, h.queries, req, false)
 	if errMsg != "" {
 		status := http.StatusBadRequest
 		if errMsg == "username already taken" {
@@ -137,31 +145,68 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
+// maxNicknameRunes bounds a nickname. Counted in runes, not bytes: the byte
+// form of the same rule rejected a 22-character Chinese nickname while telling
+// the user the limit was 64 characters.
+const maxNicknameRunes = 64
+
+// validateNickname trims and checks a nickname, returning a client-facing
+// message when it is unusable.
+func validateNickname(nickname string) (string, string) {
+	nickname = strings.TrimSpace(nickname)
+	if nickname == "" || utf8.RuneCountInString(nickname) > maxNicknameRunes {
+		return "", fmt.Sprintf("nickname must be 1-%d characters", maxNicknameRunes)
+	}
+	return nickname, ""
+}
+
+// errFirstUserExists is createUser's signal that the atomic first-run insert
+// matched nothing because some other request already created the super admin.
+var errFirstUserExists = errors.New("a user already exists")
+
 // createUser validates a registration payload and inserts the user. It
 // returns a client-facing message for validation failures (empty when the
 // user was created) and err for unexpected database errors.
-func createUser(r *http.Request, queries *sqlcgen.Queries, req registerRequest) (sqlcgen.User, string, error) {
+//
+// first selects the atomic first-run insert (CreateFirstUser, which only
+// applies while the users table is empty) over the ordinary one. Setup cannot
+// use a count-then-insert here: the bcrypt hash above sits inside that window
+// and made the check useless under concurrency.
+func createUser(r *http.Request, queries *sqlcgen.Queries, req registerRequest, first bool) (sqlcgen.User, string, error) {
 	req.Username = strings.TrimSpace(req.Username)
-	req.Nickname = strings.TrimSpace(req.Nickname)
 	if !usernamePattern.MatchString(req.Username) {
 		return sqlcgen.User{}, "username must be 1-64 chars of letters, digits, '.', '_' or '-'", nil
 	}
-	if req.Nickname == "" || len(req.Nickname) > 64 {
-		return sqlcgen.User{}, "nickname must be 1-64 characters", nil
+	nickname, errMsg := validateNickname(req.Nickname)
+	if errMsg != "" {
+		return sqlcgen.User{}, errMsg, nil
 	}
-	if len(req.Password) < minPasswordLen {
-		return sqlcgen.User{}, "password must be at least 6 characters", nil
+	if errMsg := auth.ValidatePassword(req.Password); errMsg != "" {
+		return sqlcgen.User{}, errMsg, nil
 	}
 
 	hash, err := auth.HashPassword(req.Password)
 	if err != nil {
 		return sqlcgen.User{}, "", err
 	}
-	user, err := queries.CreateUser(r.Context(), sqlcgen.CreateUserParams{
-		Username:     req.Username,
-		Nickname:     req.Nickname,
-		PasswordHash: hash,
-	})
+
+	var user sqlcgen.User
+	if first {
+		user, err = queries.CreateFirstUser(r.Context(), sqlcgen.CreateFirstUserParams{
+			Username:     req.Username,
+			Nickname:     nickname,
+			PasswordHash: hash,
+		})
+		if errors.Is(err, sql.ErrNoRows) {
+			return sqlcgen.User{}, "", errFirstUserExists
+		}
+	} else {
+		user, err = queries.CreateUser(r.Context(), sqlcgen.CreateUserParams{
+			Username:     req.Username,
+			Nickname:     nickname,
+			PasswordHash: hash,
+		})
+	}
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return sqlcgen.User{}, "username already taken", nil
@@ -190,7 +235,7 @@ func (h *AuthHandler) startSession(w http.ResponseWriter, r *http.Request, userI
 		return err
 	}
 
-	auth.SetSessionCookie(w, token, expiresAt)
+	auth.SetSessionCookie(w, token, expiresAt, requestIsSecure(r))
 
 	if err := h.queries.DeleteExpiredSessions(r.Context()); err != nil {
 		h.logger.Warn("delete expired sessions", "error", err)
@@ -204,7 +249,7 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 			h.logger.Warn("delete session", "error", err)
 		}
 	}
-	auth.ClearSessionCookie(w)
+	auth.ClearSessionCookie(w, requestIsSecure(r))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -221,8 +266,7 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(meResponse{
+	writeJSON(w, meResponse{
 		ID:       user.ID,
 		Username: user.Username,
 		Nickname: user.Nickname,

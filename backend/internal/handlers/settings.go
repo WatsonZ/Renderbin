@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"database/sql"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 
@@ -28,8 +27,7 @@ type settingsResponse struct {
 }
 
 func (h *SettingsHandler) Get(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(settingsResponse{
+	writeJSON(w, settingsResponse{
 		AllowRegistration: configBool(r, h.queries, ConfigAllowRegistration),
 		MCPEnabled:        configBool(r, h.queries, ConfigMCPEnabled),
 	})
@@ -53,8 +51,7 @@ func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req updateSettingsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	if !decodeSmallJSON(w, r, &req) {
 		return
 	}
 
@@ -91,15 +88,14 @@ func (h *SettingsHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var req updateProfileRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	if !decodeSmallJSON(w, r, &req) {
 		return
 	}
 
 	if req.Nickname != nil {
-		nickname := *req.Nickname
-		if nickname == "" || len(nickname) > 64 {
-			http.Error(w, "nickname must be 1-64 characters", http.StatusBadRequest)
+		nickname, errMsg := validateNickname(*req.Nickname)
+		if errMsg != "" {
+			http.Error(w, errMsg, http.StatusBadRequest)
 			return
 		}
 		if _, err := h.queries.UpdateUserNickname(r.Context(), sqlcgen.UpdateUserNicknameParams{
@@ -117,8 +113,8 @@ func (h *SettingsHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) 
 			http.Error(w, "current password is incorrect", http.StatusForbidden)
 			return
 		}
-		if len(req.NewPassword) < minPasswordLen {
-			http.Error(w, "password must be at least 6 characters", http.StatusBadRequest)
+		if errMsg := auth.ValidatePassword(req.NewPassword); errMsg != "" {
+			http.Error(w, errMsg, http.StatusBadRequest)
 			return
 		}
 		hash, err := auth.HashPassword(req.NewPassword)
@@ -127,7 +123,10 @@ func (h *SettingsHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) 
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		if err := h.queries.UpdateUserPassword(r.Context(), sqlcgen.UpdateUserPasswordParams{
+		// The affected-row count is ignored on purpose: requireAuth resolved
+		// this user a moment ago, so "no such row" isn't a case here. The
+		// privileged reset in admin.go is the caller that needs it.
+		if _, err := h.queries.UpdateUserPassword(r.Context(), sqlcgen.UpdateUserPasswordParams{
 			PasswordHash: hash,
 			ID:           user.ID,
 		}); err != nil {
@@ -138,6 +137,34 @@ func (h *SettingsHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) 
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+type usageResponse struct {
+	UsedBytes  int64 `json:"used_bytes"`
+	QuotaBytes int64 `json:"quota_bytes"`
+}
+
+// Usage reports the caller's stored bytes and their limit at
+// GET /api/user/usage, so the dashboard can show a quota before an upload
+// fails rather than only after.
+//
+// It is a separate call rather than a field on /api/auth/me because the layout
+// guard hits /api/auth/me on every navigation, and this one runs an aggregate.
+// The sum reads the indexed content_size column, not the documents themselves,
+// and counts trashed files too -- matching what the upload check enforces, so
+// the number on screen is the number that will be applied.
+func (h *SettingsHandler) Usage(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireUser(w, r)
+	if !ok {
+		return
+	}
+	used, err := h.queries.SumUserContentSize(r.Context(), user.ID)
+	if err != nil {
+		h.logger.Error("sum user content size", "user_id", user.ID, "error", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, usageResponse{UsedBytes: used, QuotaBytes: user.QuotaBytes})
 }
 
 type apiKeyResponse struct {
@@ -184,6 +211,5 @@ func (h *SettingsHandler) serveAPIKey(w http.ResponseWriter, r *http.Request, re
 		key = newKey
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(apiKeyResponse{APIKey: key})
+	writeJSON(w, apiKeyResponse{APIKey: key})
 }

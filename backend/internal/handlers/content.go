@@ -113,9 +113,14 @@ body{margin:0;background:#fff;color:#1f2328;font:16px/1.6 -apple-system,BlinkMac
 
 // pageShell wraps a body fragment in a minimal, self-contained HTML document
 // with an escaped title.
+//
+// No lang attribute: the uploader's document could be in any language and we
+// have nothing to infer it from, so an honest omission beats declaring every
+// page English (which is what a screen reader would then pronounce Chinese
+// content as).
 func pageShell(title, bodyHTML string) []byte {
 	var b strings.Builder
-	b.WriteString(`<!doctype html><html lang="en"><head><meta charset="utf-8">`)
+	b.WriteString(`<!doctype html><html><head><meta charset="utf-8">`)
 	b.WriteString(`<meta name="viewport" content="width=device-width, initial-scale=1">`)
 	b.WriteString("<title>")
 	b.WriteString(html.EscapeString(title))

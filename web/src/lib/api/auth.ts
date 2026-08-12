@@ -26,7 +26,10 @@ export async function login(username: string, password: string): Promise<void> {
 		body: JSON.stringify({ username, password })
 	});
 	if (!res.ok) {
-		throw new Error('Invalid username or password');
+		// The status matters here: 401 is bad credentials, while 403 means the
+		// password was right and the account is suspended — telling someone to
+		// re-check their password in that case would send them in circles.
+		throw new AuthApiError(res.status, await res.text());
 	}
 }
 

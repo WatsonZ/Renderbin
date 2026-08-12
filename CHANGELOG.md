@@ -1,0 +1,99 @@
+# Changelog
+
+Notable changes per release. Versions follow [semantic versioning](https://semver.org/),
+with the caveat that this is 0.x software: minor versions may break things, and
+this file is where those breaks are written down.
+
+Upgrades are `docker compose pull && docker compose up -d`. Database migrations
+are forward-only and apply themselves on start, so **take a backup before
+upgrading** (Settings → Backup) if you might want to go back.
+
+## v0.2.0
+
+### Breaking
+
+- **`GET /api/files/search` moved to `GET /api/search`.** A static segment at the
+  `/api/files/{slug}` level shadows any file whose custom slug happens to match
+  it, so that file's own endpoint silently answered with the search handler's
+  response. Scripts calling the old path now get a 404. Emptying the trash moved
+  to `DELETE /api/trash` for the same reason.
+- **Request bodies are capped.** Endpoints that take a small JSON payload now
+  reject anything over 64 KB with `413`. Documents keep their own, much larger
+  limit (5 MB of content); backup restore allows 256 MB and MCP 32 MB.
+- **Release tarballs no longer carry the version in their filename**:
+  `renderbin_linux_amd64.tar.gz`, not `renderbin_v0.2.0_linux_amd64.tar.gz`. The
+  old name could never be fetched through `/releases/latest/download/`, which is
+  the URL the README documents — so that quickstart was broken for v0.1.0. Pin
+  the version in the URL path if you need a specific release. The version is
+  stamped into the binary and reported by `GET /api/health`.
+
+### Behaviour changes to know about before upgrading
+
+- **Every account gets a 100 MB storage quota.** Existing accounts included. An
+  account already storing more than that keeps every file it has, but cannot
+  upload or edit until the super admin raises its limit in
+  **Settings → Accounts**. Trashed files count toward the quota, because they
+  still occupy the database.
+- **Uploaded pages are sandboxed.** `/res/{slug}` now sends
+  `Content-Security-Policy: sandbox allow-scripts …`. Scripts, links, forms and
+  downloads still work, but a shared document can no longer call this app's API
+  as whoever is viewing it. If you were relying on a published page talking to
+  the API from the same origin, it will stop working.
+- **The super admin can no longer reset their own password** through
+  Settings → Accounts; use the profile section (which asks for the current
+  password) or the `reset-password` CLI subcommand.
+
+### Added
+
+- **Account management**: create an account (the password is generated and shown
+  once), delete an account together with all of its files, and set a per-account
+  storage quota — alongside the existing suspend/restore and password reset.
+- **Storage visibility**: every file row shows its size, the dashboard shows
+  usage against the quota, and the accounts list shows both per account.
+  `GET /api/user/usage` exposes the same figures.
+- `reset-password` CLI subcommand, for the one lockout the app cannot fix from
+  inside: `docker compose exec app ./server reset-password --user=NAME`.
+
+### Fixed
+
+- **First-run setup was a race.** Concurrent requests to `/api/setup` each
+  created an account; only the first became the super admin. A double-clicked
+  welcome form left a stray account, and a freshly exposed instance could be
+  raced for ownership.
+- **A password over 72 bytes returned "internal error".** bcrypt's own limit is
+  in bytes, so an ordinary 25-character Chinese passphrase was rejected with no
+  explanation on the very first screen. Nicknames are likewise now measured in
+  characters rather than bytes.
+- **Unmatched `/api/…` paths returned `200` and the SPA's HTML** instead of a
+  JSON 404, so a typo in a client surfaced as an opaque JSON parse error and
+  monitoring saw a healthy 200 for a route that does not exist.
+- **An oversized upload reported "invalid request body"** instead of naming the
+  5 MB limit, and a legal 5 MB document could trip it because of JSON escaping.
+- **Copy-to-clipboard silently did nothing over plain HTTP.** It now falls back,
+  and shows the link in a selectable field if the browser refuses outright.
+- **The trash list went stale**, so a file deleted after visiting the Trash tab
+  appeared in neither list and looked like it had been destroyed.
+- **Restoring a backup overwrote the migration ledger**, which could make the
+  running binary skip a migration permanently.
+- **Listing files read every document's full source out of the database** only
+  to discard it. An account holding 160 MB drove the server to ~350 MB of memory
+  to answer a 13 KB request; it is now ~68 MB.
+- Refreshing a file's access code now asks for confirmation — it invalidates
+  every link already shared, with no undo.
+- Uploads, tags and names are bounded, so a long name can no longer overflow a
+  reverse proxy's header buffer and turn downloads into a 502.
+
+### Security
+
+- Uploaded HTML and Markdown are sandboxed (see above). Combined with the
+  self-reset fix, a document uploaded by one account and opened by another can
+  no longer act as that viewer.
+- `X-Content-Type-Options`, `Referrer-Policy: no-referrer` and `X-Frame-Options`
+  on every response. The referrer policy matters because a file's access code
+  travels in the query string.
+- Updated `modelcontextprotocol/go-sdk` to v1.4.1 and the Go toolchain to
+  1.26.5, clearing 13 vulnerabilities that `govulncheck` reported as reachable.
+
+## v0.1.0
+
+First release.

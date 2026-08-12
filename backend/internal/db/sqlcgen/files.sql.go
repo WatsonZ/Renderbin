@@ -8,13 +8,19 @@ package sqlcgen
 import (
 	"context"
 	"database/sql"
+	"time"
 )
 
 const clearFileExpiry = `-- name: ClearFileExpiry :one
 UPDATE files
-SET expires_at = NULL, max_views = NULL, view_count = 0, updated_at = CURRENT_TIMESTAMP
+SET expires_at = NULL,
+    max_views = NULL,
+    view_count = 0,
+    expired_at = NULL,
+    expired_reason = '',
+    updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?1 AND user_id = ?2 AND deleted_at IS NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id
+RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size
 `
 
 type ClearFileExpiryParams struct {
@@ -44,15 +50,27 @@ func (q *Queries) ClearFileExpiry(ctx context.Context, arg ClearFileExpiryParams
 		&i.Kind,
 		&i.CodeSuccessCount,
 		&i.UserID,
+		&i.ExpiredAt,
+		&i.ExpiredReason,
+		&i.ContentSize,
 	)
 	return i, err
 }
 
 const createFile = `-- name: CreateFile :one
 
-INSERT INTO files (slug, name, html_content, kind, is_public, access_code, user_id)
-VALUES (?, ?, ?, ?, ?, ?, ?)
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id
+INSERT INTO files (slug, name, html_content, content_size, kind, is_public, access_code, user_id)
+VALUES (
+    ?1,
+    ?2,
+    ?3,
+    length(CAST(?3 AS BLOB)),
+    ?4,
+    ?5,
+    ?6,
+    ?7
+)
+RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size
 `
 
 type CreateFileParams struct {
@@ -77,6 +95,10 @@ type CreateFileParams struct {
 //
 // New file queries belong in this section and MUST carry the predicate.
 // ===========================================================================
+// content_size is derived from html_content by the statement itself, here and
+// in UpdateFile, so the two can never drift: there is no way to write the
+// content through this schema without writing its size in the same statement.
+// length(CAST(x AS BLOB)) is bytes; bare length() on TEXT counts characters.
 func (q *Queries) CreateFile(ctx context.Context, arg CreateFileParams) (File, error) {
 	row := q.db.QueryRowContext(ctx, createFile,
 		arg.Slug,
@@ -107,25 +129,66 @@ func (q *Queries) CreateFile(ctx context.Context, arg CreateFileParams) (File, e
 		&i.Kind,
 		&i.CodeSuccessCount,
 		&i.UserID,
+		&i.ExpiredAt,
+		&i.ExpiredReason,
+		&i.ContentSize,
 	)
 	return i, err
 }
 
-const expireFile = `-- name: ExpireFile :exec
-UPDATE files
-SET is_public = 0, expires_at = NULL, max_views = NULL
-WHERE slug = ? AND deleted_at IS NULL
+const deleteUserFiles = `-- name: DeleteUserFiles :execrows
+
+DELETE FROM files
+WHERE user_id = ?1
 `
 
-func (q *Queries) ExpireFile(ctx context.Context, slug string) error {
-	_, err := q.db.ExecContext(ctx, expireFile, slug)
+// ===========================================================================
+// ADMIN CASCADE -- account deletion only (DELETE /api/admin/users/{id}).
+//
+// This one carries user_id like everything above it, but the id is the
+// *target account's*, never the caller's, so the owner-scoping argument that
+// protects the section above does not apply here: the predicate cannot stop a
+// caller from naming someone else, only the super-admin check in the handler
+// can. It also has no deleted_at guard -- deleting an account takes its trash
+// with it, which is the point -- so unlike HardDeleteUserTrash there is no
+// second predicate standing between a mistake and every file the account owns.
+// Call it from AdminHandler.Delete and nowhere else, inside its transaction.
+// ===========================================================================
+func (q *Queries) DeleteUserFiles(ctx context.Context, userID int64) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteUserFiles, userID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const expireFile = `-- name: ExpireFile :exec
+UPDATE files
+SET is_public = 0,
+    expires_at = NULL,
+    max_views = NULL,
+    expired_at = CURRENT_TIMESTAMP,
+    expired_reason = ?1
+WHERE slug = ?2 AND deleted_at IS NULL
+`
+
+type ExpireFileParams struct {
+	ExpiredReason string `json:"expired_reason"`
+	Slug          string `json:"slug"`
+}
+
+// Taking a file offline records why, overwriting any earlier event: only the
+// most recent one is kept, which is all the dashboard badge claims to show.
+func (q *Queries) ExpireFile(ctx context.Context, arg ExpireFileParams) error {
+	_, err := q.db.ExecContext(ctx, expireFile, arg.ExpiredReason, arg.Slug)
 	return err
 }
 
 const getFileBySlugAnyOwner = `-- name: GetFileBySlugAnyOwner :one
 
-SELECT id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id FROM files
-WHERE slug = ? AND deleted_at IS NULL
+SELECT files.id, files.slug, files.name, files.html_content, files.is_public, files.access_code, files.created_at, files.updated_at, files.deleted_at, files.success_count, files.failure_count, files.tags, files.expires_at, files.max_views, files.view_count, files.kind, files.code_success_count, files.user_id, files.expired_at, files.expired_reason, files.content_size FROM files
+JOIN users ON users.id = files.user_id
+WHERE files.slug = ? AND files.deleted_at IS NULL AND users.disabled_at IS NULL
 `
 
 // ===========================================================================
@@ -137,6 +200,10 @@ WHERE slug = ? AND deleted_at IS NULL
 // that is exactly how the IDOR this section exists to prevent was introduced.
 // See FilesHandler.Render.
 // ===========================================================================
+// The join is the enforcement point for account suspension: a suspended
+// owner's files simply match no row here, so every one of their share links
+// becomes the same 404 a slug that never existed gets. Doing it in SQL rather
+// than as a Go check after the fact means the render path cannot forget.
 func (q *Queries) GetFileBySlugAnyOwner(ctx context.Context, slug string) (File, error) {
 	row := q.db.QueryRowContext(ctx, getFileBySlugAnyOwner, slug)
 	var i File
@@ -159,12 +226,15 @@ func (q *Queries) GetFileBySlugAnyOwner(ctx context.Context, slug string) (File,
 		&i.Kind,
 		&i.CodeSuccessCount,
 		&i.UserID,
+		&i.ExpiredAt,
+		&i.ExpiredReason,
+		&i.ContentSize,
 	)
 	return i, err
 }
 
 const getUserFileBySlug = `-- name: GetUserFileBySlug :one
-SELECT id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id FROM files
+SELECT id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size FROM files
 WHERE slug = ?1 AND user_id = ?2 AND deleted_at IS NULL
 `
 
@@ -195,8 +265,30 @@ func (q *Queries) GetUserFileBySlug(ctx context.Context, arg GetUserFileBySlugPa
 		&i.Kind,
 		&i.CodeSuccessCount,
 		&i.UserID,
+		&i.ExpiredAt,
+		&i.ExpiredReason,
+		&i.ContentSize,
 	)
 	return i, err
+}
+
+const getUserFileSize = `-- name: GetUserFileSize :one
+SELECT content_size FROM files
+WHERE slug = ?1 AND user_id = ?2 AND deleted_at IS NULL
+`
+
+type GetUserFileSizeParams struct {
+	Slug   string `json:"slug"`
+	UserID int64  `json:"user_id"`
+}
+
+// What an edit is replacing, so the quota check can subtract it instead of
+// charging the account twice for a file it already stores.
+func (q *Queries) GetUserFileSize(ctx context.Context, arg GetUserFileSizeParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, getUserFileSize, arg.Slug, arg.UserID)
+	var content_size int64
+	err := row.Scan(&content_size)
+	return content_size, err
 }
 
 const hardDeleteFile = `-- name: HardDeleteFile :execrows
@@ -211,6 +303,22 @@ type HardDeleteFileParams struct {
 
 func (q *Queries) HardDeleteFile(ctx context.Context, arg HardDeleteFileParams) (int64, error) {
 	result, err := q.db.ExecContext(ctx, hardDeleteFile, arg.Slug, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const hardDeleteUserTrash = `-- name: HardDeleteUserTrash :execrows
+DELETE FROM files
+WHERE user_id = ?1 AND deleted_at IS NOT NULL
+`
+
+// Empty the trash. deleted_at IS NOT NULL is the whole safety property here:
+// this is the only unbounded delete in the file, so if that predicate is ever
+// dropped it takes the user's live files with it.
+func (q *Queries) HardDeleteUserTrash(ctx context.Context, userID int64) (int64, error) {
+	result, err := q.db.ExecContext(ctx, hardDeleteUserTrash, userID)
 	if err != nil {
 		return 0, err
 	}
@@ -262,25 +370,50 @@ func (q *Queries) IncrementFileViewCount(ctx context.Context, slug string) error
 }
 
 const listUserDeletedFiles = `-- name: ListUserDeletedFiles :many
-SELECT id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id FROM files
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at,
+       success_count, failure_count, tags, expires_at, max_views, view_count,
+       kind, code_success_count, user_id, expired_at, expired_reason, content_size
+FROM files
 WHERE deleted_at IS NOT NULL AND user_id = ?1
 ORDER BY deleted_at DESC
 `
 
-func (q *Queries) ListUserDeletedFiles(ctx context.Context, userID int64) ([]File, error) {
+type ListUserDeletedFilesRow struct {
+	ID               int64         `json:"id"`
+	Slug             string        `json:"slug"`
+	Name             string        `json:"name"`
+	IsPublic         bool          `json:"is_public"`
+	AccessCode       string        `json:"access_code"`
+	CreatedAt        time.Time     `json:"created_at"`
+	UpdatedAt        time.Time     `json:"updated_at"`
+	DeletedAt        sql.NullTime  `json:"deleted_at"`
+	SuccessCount     int64         `json:"success_count"`
+	FailureCount     int64         `json:"failure_count"`
+	Tags             string        `json:"tags"`
+	ExpiresAt        sql.NullTime  `json:"expires_at"`
+	MaxViews         sql.NullInt64 `json:"max_views"`
+	ViewCount        int64         `json:"view_count"`
+	Kind             string        `json:"kind"`
+	CodeSuccessCount int64         `json:"code_success_count"`
+	UserID           int64         `json:"user_id"`
+	ExpiredAt        sql.NullTime  `json:"expired_at"`
+	ExpiredReason    string        `json:"expired_reason"`
+	ContentSize      int64         `json:"content_size"`
+}
+
+func (q *Queries) ListUserDeletedFiles(ctx context.Context, userID int64) ([]ListUserDeletedFilesRow, error) {
 	rows, err := q.db.QueryContext(ctx, listUserDeletedFiles, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []File
+	var items []ListUserDeletedFilesRow
 	for rows.Next() {
-		var i File
+		var i ListUserDeletedFilesRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Slug,
 			&i.Name,
-			&i.HtmlContent,
 			&i.IsPublic,
 			&i.AccessCode,
 			&i.CreatedAt,
@@ -295,6 +428,9 @@ func (q *Queries) ListUserDeletedFiles(ctx context.Context, userID int64) ([]Fil
 			&i.Kind,
 			&i.CodeSuccessCount,
 			&i.UserID,
+			&i.ExpiredAt,
+			&i.ExpiredReason,
+			&i.ContentSize,
 		); err != nil {
 			return nil, err
 		}
@@ -310,25 +446,56 @@ func (q *Queries) ListUserDeletedFiles(ctx context.Context, userID int64) ([]Fil
 }
 
 const listUserFiles = `-- name: ListUserFiles :many
-SELECT id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id FROM files
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at,
+       success_count, failure_count, tags, expires_at, max_views, view_count,
+       kind, code_success_count, user_id, expired_at, expired_reason, content_size
+FROM files
 WHERE deleted_at IS NULL AND user_id = ?1
 ORDER BY created_at DESC
 `
 
-func (q *Queries) ListUserFiles(ctx context.Context, userID int64) ([]File, error) {
+type ListUserFilesRow struct {
+	ID               int64         `json:"id"`
+	Slug             string        `json:"slug"`
+	Name             string        `json:"name"`
+	IsPublic         bool          `json:"is_public"`
+	AccessCode       string        `json:"access_code"`
+	CreatedAt        time.Time     `json:"created_at"`
+	UpdatedAt        time.Time     `json:"updated_at"`
+	DeletedAt        sql.NullTime  `json:"deleted_at"`
+	SuccessCount     int64         `json:"success_count"`
+	FailureCount     int64         `json:"failure_count"`
+	Tags             string        `json:"tags"`
+	ExpiresAt        sql.NullTime  `json:"expires_at"`
+	MaxViews         sql.NullInt64 `json:"max_views"`
+	ViewCount        int64         `json:"view_count"`
+	Kind             string        `json:"kind"`
+	CodeSuccessCount int64         `json:"code_success_count"`
+	UserID           int64         `json:"user_id"`
+	ExpiredAt        sql.NullTime  `json:"expired_at"`
+	ExpiredReason    string        `json:"expired_reason"`
+	ContentSize      int64         `json:"content_size"`
+}
+
+// The two listings and the name search deliberately do NOT select
+// html_content. They used to be SELECT *, which read every document's full
+// source out of SQLite so the handler could blank the field before encoding --
+// 350MB of RSS to answer a 13KB request for an account holding 160MB. Anything
+// added here must stay off html_content; GetUserFileBySlug is the endpoint that
+// returns content, and it returns one row.
+func (q *Queries) ListUserFiles(ctx context.Context, userID int64) ([]ListUserFilesRow, error) {
 	rows, err := q.db.QueryContext(ctx, listUserFiles, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []File
+	var items []ListUserFilesRow
 	for rows.Next() {
-		var i File
+		var i ListUserFilesRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Slug,
 			&i.Name,
-			&i.HtmlContent,
 			&i.IsPublic,
 			&i.AccessCode,
 			&i.CreatedAt,
@@ -343,6 +510,9 @@ func (q *Queries) ListUserFiles(ctx context.Context, userID int64) ([]File, erro
 			&i.Kind,
 			&i.CodeSuccessCount,
 			&i.UserID,
+			&i.ExpiredAt,
+			&i.ExpiredReason,
+			&i.ContentSize,
 		); err != nil {
 			return nil, err
 		}
@@ -361,7 +531,7 @@ const refreshFileAccessCode = `-- name: RefreshFileAccessCode :one
 UPDATE files
 SET access_code = ?1, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?2 AND user_id = ?3 AND deleted_at IS NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id
+RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size
 `
 
 type RefreshFileAccessCodeParams struct {
@@ -392,6 +562,9 @@ func (q *Queries) RefreshFileAccessCode(ctx context.Context, arg RefreshFileAcce
 		&i.Kind,
 		&i.CodeSuccessCount,
 		&i.UserID,
+		&i.ExpiredAt,
+		&i.ExpiredReason,
+		&i.ContentSize,
 	)
 	return i, err
 }
@@ -400,7 +573,7 @@ const renameFile = `-- name: RenameFile :one
 UPDATE files
 SET name = ?1, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?2 AND user_id = ?3 AND deleted_at IS NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id
+RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size
 `
 
 type RenameFileParams struct {
@@ -431,6 +604,9 @@ func (q *Queries) RenameFile(ctx context.Context, arg RenameFileParams) (File, e
 		&i.Kind,
 		&i.CodeSuccessCount,
 		&i.UserID,
+		&i.ExpiredAt,
+		&i.ExpiredReason,
+		&i.ContentSize,
 	)
 	return i, err
 }
@@ -439,7 +615,7 @@ const restoreFile = `-- name: RestoreFile :one
 UPDATE files
 SET deleted_at = NULL, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?1 AND user_id = ?2 AND deleted_at IS NOT NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id
+RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size
 `
 
 type RestoreFileParams struct {
@@ -469,13 +645,19 @@ func (q *Queries) RestoreFile(ctx context.Context, arg RestoreFileParams) (File,
 		&i.Kind,
 		&i.CodeSuccessCount,
 		&i.UserID,
+		&i.ExpiredAt,
+		&i.ExpiredReason,
+		&i.ContentSize,
 	)
 	return i, err
 }
 
 const searchUserFilesByName = `-- name: SearchUserFilesByName :many
 
-SELECT id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id FROM files
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at,
+       success_count, failure_count, tags, expires_at, max_views, view_count,
+       kind, code_success_count, user_id, expired_at, expired_reason, content_size
+FROM files
 WHERE deleted_at IS NULL AND user_id = ?1
   AND instr(lower(name), lower(?2)) > 0
 ORDER BY created_at DESC
@@ -486,23 +668,45 @@ type SearchUserFilesByNameParams struct {
 	NameQuery string `json:"name_query"`
 }
 
+type SearchUserFilesByNameRow struct {
+	ID               int64         `json:"id"`
+	Slug             string        `json:"slug"`
+	Name             string        `json:"name"`
+	IsPublic         bool          `json:"is_public"`
+	AccessCode       string        `json:"access_code"`
+	CreatedAt        time.Time     `json:"created_at"`
+	UpdatedAt        time.Time     `json:"updated_at"`
+	DeletedAt        sql.NullTime  `json:"deleted_at"`
+	SuccessCount     int64         `json:"success_count"`
+	FailureCount     int64         `json:"failure_count"`
+	Tags             string        `json:"tags"`
+	ExpiresAt        sql.NullTime  `json:"expires_at"`
+	MaxViews         sql.NullInt64 `json:"max_views"`
+	ViewCount        int64         `json:"view_count"`
+	Kind             string        `json:"kind"`
+	CodeSuccessCount int64         `json:"code_success_count"`
+	UserID           int64         `json:"user_id"`
+	ExpiredAt        sql.NullTime  `json:"expired_at"`
+	ExpiredReason    string        `json:"expired_reason"`
+	ContentSize      int64         `json:"content_size"`
+}
+
 // Plain substring search via instr() rather than LIKE: no wildcard/escape
 // handling needed, and lower() gives the same ASCII-only case-insensitivity
 // LIKE would.
-func (q *Queries) SearchUserFilesByName(ctx context.Context, arg SearchUserFilesByNameParams) ([]File, error) {
+func (q *Queries) SearchUserFilesByName(ctx context.Context, arg SearchUserFilesByNameParams) ([]SearchUserFilesByNameRow, error) {
 	rows, err := q.db.QueryContext(ctx, searchUserFilesByName, arg.UserID, arg.NameQuery)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []File
+	var items []SearchUserFilesByNameRow
 	for rows.Next() {
-		var i File
+		var i SearchUserFilesByNameRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Slug,
 			&i.Name,
-			&i.HtmlContent,
 			&i.IsPublic,
 			&i.AccessCode,
 			&i.CreatedAt,
@@ -517,6 +721,9 @@ func (q *Queries) SearchUserFilesByName(ctx context.Context, arg SearchUserFiles
 			&i.Kind,
 			&i.CodeSuccessCount,
 			&i.UserID,
+			&i.ExpiredAt,
+			&i.ExpiredReason,
+			&i.ContentSize,
 		); err != nil {
 			return nil, err
 		}
@@ -532,33 +739,75 @@ func (q *Queries) SearchUserFilesByName(ctx context.Context, arg SearchUserFiles
 }
 
 const searchUserFilesWithContent = `-- name: SearchUserFilesWithContent :many
-SELECT id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id FROM files
-WHERE deleted_at IS NULL AND user_id = ?1
-  AND (instr(lower(name), lower(?2)) > 0
-    OR instr(lower(html_content), lower(?3)) > 0)
+SELECT id, slug, name, is_public, access_code, created_at, updated_at, deleted_at,
+       success_count, failure_count, tags, expires_at, max_views, view_count,
+       kind, code_success_count, user_id, expired_at, expired_reason, content_size,
+       CAST(instr(lower(html_content), lower(?1)) AS INTEGER) AS match_pos,
+       CAST(length(html_content) AS INTEGER) AS content_chars,
+       CAST(substr(html_content,
+              MAX(1, instr(lower(html_content), lower(?1)) - 100),
+              length(?1) + 200) AS TEXT) AS snippet_window
+FROM files
+WHERE deleted_at IS NULL AND user_id = ?2
+  AND (instr(lower(name), lower(?3)) > 0
+    OR instr(lower(html_content), lower(?1)) > 0)
 ORDER BY created_at DESC
 `
 
 type SearchUserFilesWithContentParams struct {
+	ContentQuery string `json:"content_query"`
 	UserID       int64  `json:"user_id"`
 	NameQuery    string `json:"name_query"`
-	ContentQuery string `json:"content_query"`
 }
 
-func (q *Queries) SearchUserFilesWithContent(ctx context.Context, arg SearchUserFilesWithContentParams) ([]File, error) {
-	rows, err := q.db.QueryContext(ctx, searchUserFilesWithContent, arg.UserID, arg.NameQuery, arg.ContentQuery)
+type SearchUserFilesWithContentRow struct {
+	ID               int64         `json:"id"`
+	Slug             string        `json:"slug"`
+	Name             string        `json:"name"`
+	IsPublic         bool          `json:"is_public"`
+	AccessCode       string        `json:"access_code"`
+	CreatedAt        time.Time     `json:"created_at"`
+	UpdatedAt        time.Time     `json:"updated_at"`
+	DeletedAt        sql.NullTime  `json:"deleted_at"`
+	SuccessCount     int64         `json:"success_count"`
+	FailureCount     int64         `json:"failure_count"`
+	Tags             string        `json:"tags"`
+	ExpiresAt        sql.NullTime  `json:"expires_at"`
+	MaxViews         sql.NullInt64 `json:"max_views"`
+	ViewCount        int64         `json:"view_count"`
+	Kind             string        `json:"kind"`
+	CodeSuccessCount int64         `json:"code_success_count"`
+	UserID           int64         `json:"user_id"`
+	ExpiredAt        sql.NullTime  `json:"expired_at"`
+	ExpiredReason    string        `json:"expired_reason"`
+	ContentSize      int64         `json:"content_size"`
+	MatchPos         int64         `json:"match_pos"`
+	ContentChars     int64         `json:"content_chars"`
+	SnippetWindow    string        `json:"snippet_window"`
+}
+
+// Content search returns a bounded window around the first match instead of
+// the whole document, for the same reason the listings dropped html_content: a
+// query matching fifty 5MB files would otherwise pull 250MB into memory to
+// render fifty 200-character excerpts.
+//
+// match_pos is instr()'s 1-based character offset (0 when only the name
+// matched); snippet_window is up to 100 characters either side of the match.
+// Both instr() and substr() count characters here, not bytes, so the window is
+// rune-safe and the handler only has to decide about ellipses.
+func (q *Queries) SearchUserFilesWithContent(ctx context.Context, arg SearchUserFilesWithContentParams) ([]SearchUserFilesWithContentRow, error) {
+	rows, err := q.db.QueryContext(ctx, searchUserFilesWithContent, arg.ContentQuery, arg.UserID, arg.NameQuery)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []File
+	var items []SearchUserFilesWithContentRow
 	for rows.Next() {
-		var i File
+		var i SearchUserFilesWithContentRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Slug,
 			&i.Name,
-			&i.HtmlContent,
 			&i.IsPublic,
 			&i.AccessCode,
 			&i.CreatedAt,
@@ -573,6 +822,12 @@ func (q *Queries) SearchUserFilesWithContent(ctx context.Context, arg SearchUser
 			&i.Kind,
 			&i.CodeSuccessCount,
 			&i.UserID,
+			&i.ExpiredAt,
+			&i.ExpiredReason,
+			&i.ContentSize,
+			&i.MatchPos,
+			&i.ContentChars,
+			&i.SnippetWindow,
 		); err != nil {
 			return nil, err
 		}
@@ -593,9 +848,11 @@ SET is_public = 1,
     expires_at = ?1,
     max_views = ?2,
     view_count = 0,
+    expired_at = NULL,
+    expired_reason = '',
     updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?3 AND user_id = ?4 AND deleted_at IS NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id
+RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size
 `
 
 type SetFileExpiryParams struct {
@@ -605,6 +862,9 @@ type SetFileExpiryParams struct {
 	UserID    int64         `json:"user_id"`
 }
 
+// Both expiry writers clear expired_at/expired_reason: that marker records the
+// last time a limit took the file offline, and leaving it set next to a freshly
+// configured (or freshly removed) limit would contradict the file's own state.
 func (q *Queries) SetFileExpiry(ctx context.Context, arg SetFileExpiryParams) (File, error) {
 	row := q.db.QueryRowContext(ctx, setFileExpiry,
 		arg.ExpiresAt,
@@ -632,6 +892,9 @@ func (q *Queries) SetFileExpiry(ctx context.Context, arg SetFileExpiryParams) (F
 		&i.Kind,
 		&i.CodeSuccessCount,
 		&i.UserID,
+		&i.ExpiredAt,
+		&i.ExpiredReason,
+		&i.ContentSize,
 	)
 	return i, err
 }
@@ -640,7 +903,7 @@ const setFileTags = `-- name: SetFileTags :one
 UPDATE files
 SET tags = ?1, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?2 AND user_id = ?3 AND deleted_at IS NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id
+RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size
 `
 
 type SetFileTagsParams struct {
@@ -671,6 +934,9 @@ func (q *Queries) SetFileTags(ctx context.Context, arg SetFileTagsParams) (File,
 		&i.Kind,
 		&i.CodeSuccessCount,
 		&i.UserID,
+		&i.ExpiredAt,
+		&i.ExpiredReason,
+		&i.ContentSize,
 	)
 	return i, err
 }
@@ -679,7 +945,7 @@ const setFileVisibility = `-- name: SetFileVisibility :one
 UPDATE files
 SET is_public = ?1, updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?2 AND user_id = ?3 AND deleted_at IS NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id
+RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size
 `
 
 type SetFileVisibilityParams struct {
@@ -710,6 +976,9 @@ func (q *Queries) SetFileVisibility(ctx context.Context, arg SetFileVisibilityPa
 		&i.Kind,
 		&i.CodeSuccessCount,
 		&i.UserID,
+		&i.ExpiredAt,
+		&i.ExpiredReason,
+		&i.ContentSize,
 	)
 	return i, err
 }
@@ -735,15 +1004,32 @@ func (q *Queries) SoftDeleteFile(ctx context.Context, arg SoftDeleteFileParams) 
 	return result.RowsAffected()
 }
 
+const sumUserContentSize = `-- name: SumUserContentSize :one
+SELECT CAST(COALESCE(SUM(content_size), 0) AS INTEGER) AS used_bytes FROM files
+WHERE user_id = ?1
+`
+
+// The caller's total stored bytes, used to enforce users.quota_bytes. Trashed
+// rows are included on purpose: they still occupy the database, and emptying
+// the trash is a user action, so excluding them would make soft-delete an
+// unlimited quota bypass.
+func (q *Queries) SumUserContentSize(ctx context.Context, userID int64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, sumUserContentSize, userID)
+	var used_bytes int64
+	err := row.Scan(&used_bytes)
+	return used_bytes, err
+}
+
 const updateFile = `-- name: UpdateFile :one
 UPDATE files
 SET name = ?1,
     slug = ?2,
     html_content = ?3,
+    content_size = length(CAST(?3 AS BLOB)),
     access_code = ?4,
     updated_at = CURRENT_TIMESTAMP
 WHERE slug = ?5 AND user_id = ?6 AND deleted_at IS NULL
-RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id
+RETURNING id, slug, name, html_content, is_public, access_code, created_at, updated_at, deleted_at, success_count, failure_count, tags, expires_at, max_views, view_count, kind, code_success_count, user_id, expired_at, expired_reason, content_size
 `
 
 type UpdateFileParams struct {
@@ -786,6 +1072,9 @@ func (q *Queries) UpdateFile(ctx context.Context, arg UpdateFileParams) (File, e
 		&i.Kind,
 		&i.CodeSuccessCount,
 		&i.UserID,
+		&i.ExpiredAt,
+		&i.ExpiredReason,
+		&i.ContentSize,
 	)
 	return i, err
 }

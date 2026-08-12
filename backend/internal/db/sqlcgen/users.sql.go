@@ -8,6 +8,7 @@ package sqlcgen
 import (
 	"context"
 	"database/sql"
+	"time"
 )
 
 const countUsers = `-- name: CountUsers :one
@@ -21,10 +22,49 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 	return count, err
 }
 
+const createFirstUser = `-- name: CreateFirstUser :one
+INSERT INTO users (username, nickname, password_hash)
+SELECT ?1, ?2, ?3
+WHERE NOT EXISTS (SELECT 1 FROM users)
+RETURNING id, username, nickname, password_hash, api_key, created_at, updated_at, disabled_at, quota_bytes
+`
+
+type CreateFirstUserParams struct {
+	Username     string `json:"username"`
+	Nickname     string `json:"nickname"`
+	PasswordHash string `json:"password_hash"`
+}
+
+// The first-run account, and the reason it is a separate statement: the
+// welcome flow used to read CountUsers, decide the table was empty, spend
+// ~80ms hashing a password, and only then INSERT. Six concurrent POSTs to
+// /api/setup all passed the check and created six accounts, of which only id=1
+// got the (non-transferable) super-admin role -- so a double-clicked form left
+// a stray account and an exposed instance could be raced for ownership.
+// WHERE NOT EXISTS moves the decision into the write itself: the loser of the
+// race matches no row and the handler turns that into the same 409 a late
+// sequential request already got.
+func (q *Queries) CreateFirstUser(ctx context.Context, arg CreateFirstUserParams) (User, error) {
+	row := q.db.QueryRowContext(ctx, createFirstUser, arg.Username, arg.Nickname, arg.PasswordHash)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Username,
+		&i.Nickname,
+		&i.PasswordHash,
+		&i.ApiKey,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DisabledAt,
+		&i.QuotaBytes,
+	)
+	return i, err
+}
+
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (username, nickname, password_hash)
 VALUES (?, ?, ?)
-RETURNING id, username, nickname, password_hash, api_key, created_at, updated_at
+RETURNING id, username, nickname, password_hash, api_key, created_at, updated_at, disabled_at, quota_bytes
 `
 
 type CreateUserParams struct {
@@ -44,12 +84,81 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.ApiKey,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DisabledAt,
+		&i.QuotaBytes,
+	)
+	return i, err
+}
+
+const deleteUser = `-- name: DeleteUser :execrows
+DELETE FROM users
+WHERE id = ?1
+`
+
+// Account deletion. Callers must delete the account's files and sessions in
+// the same transaction (there are no foreign keys to cascade for us), and the
+// handler must refuse id=1: the super admin is the only account that can
+// manage accounts, so removing it would be a one-way door out of the app.
+func (q *Queries) DeleteUser(ctx context.Context, id int64) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteUser, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const disableUser = `-- name: DisableUser :one
+UPDATE users
+SET disabled_at = COALESCE(disabled_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP
+WHERE id = ?
+RETURNING id, username, nickname, password_hash, api_key, created_at, updated_at, disabled_at, quota_bytes
+`
+
+// COALESCE keeps the original suspension time, so re-suspending an already
+// suspended account is a no-op rather than a way to lose when it happened.
+func (q *Queries) DisableUser(ctx context.Context, id int64) (User, error) {
+	row := q.db.QueryRowContext(ctx, disableUser, id)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Username,
+		&i.Nickname,
+		&i.PasswordHash,
+		&i.ApiKey,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DisabledAt,
+		&i.QuotaBytes,
+	)
+	return i, err
+}
+
+const enableUser = `-- name: EnableUser :one
+UPDATE users
+SET disabled_at = NULL, updated_at = CURRENT_TIMESTAMP
+WHERE id = ?
+RETURNING id, username, nickname, password_hash, api_key, created_at, updated_at, disabled_at, quota_bytes
+`
+
+func (q *Queries) EnableUser(ctx context.Context, id int64) (User, error) {
+	row := q.db.QueryRowContext(ctx, enableUser, id)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Username,
+		&i.Nickname,
+		&i.PasswordHash,
+		&i.ApiKey,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DisabledAt,
+		&i.QuotaBytes,
 	)
 	return i, err
 }
 
 const getUserByAPIKey = `-- name: GetUserByAPIKey :one
-SELECT id, username, nickname, password_hash, api_key, created_at, updated_at FROM users
+SELECT id, username, nickname, password_hash, api_key, created_at, updated_at, disabled_at, quota_bytes FROM users
 WHERE api_key = ?
 `
 
@@ -64,12 +173,14 @@ func (q *Queries) GetUserByAPIKey(ctx context.Context, apiKey sql.NullString) (U
 		&i.ApiKey,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DisabledAt,
+		&i.QuotaBytes,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, username, nickname, password_hash, api_key, created_at, updated_at FROM users
+SELECT id, username, nickname, password_hash, api_key, created_at, updated_at, disabled_at, quota_bytes FROM users
 WHERE id = ?
 `
 
@@ -84,12 +195,14 @@ func (q *Queries) GetUserByID(ctx context.Context, id int64) (User, error) {
 		&i.ApiKey,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DisabledAt,
+		&i.QuotaBytes,
 	)
 	return i, err
 }
 
 const getUserByUsername = `-- name: GetUserByUsername :one
-SELECT id, username, nickname, password_hash, api_key, created_at, updated_at FROM users
+SELECT id, username, nickname, password_hash, api_key, created_at, updated_at, disabled_at, quota_bytes FROM users
 WHERE username = ?
 `
 
@@ -104,8 +217,78 @@ func (q *Queries) GetUserByUsername(ctx context.Context, username string) (User,
 		&i.ApiKey,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DisabledAt,
+		&i.QuotaBytes,
 	)
 	return i, err
+}
+
+const listUsersWithFileCounts = `-- name: ListUsersWithFileCounts :many
+SELECT users.id, users.username, users.nickname, users.password_hash, users.api_key, users.created_at, users.updated_at, users.disabled_at, users.quota_bytes,
+    (SELECT COUNT(*) FROM files
+     WHERE files.user_id = users.id AND files.deleted_at IS NULL) AS file_count,
+    (SELECT COUNT(*) FROM files
+     WHERE files.user_id = users.id AND files.deleted_at IS NOT NULL) AS trashed_count,
+    CAST((SELECT COALESCE(SUM(content_size), 0) FROM files
+     WHERE files.user_id = users.id) AS INTEGER) AS used_bytes
+FROM users
+ORDER BY users.id
+`
+
+type ListUsersWithFileCountsRow struct {
+	ID           int64          `json:"id"`
+	Username     string         `json:"username"`
+	Nickname     string         `json:"nickname"`
+	PasswordHash string         `json:"password_hash"`
+	ApiKey       sql.NullString `json:"api_key"`
+	CreatedAt    time.Time      `json:"created_at"`
+	UpdatedAt    time.Time      `json:"updated_at"`
+	DisabledAt   sql.NullTime   `json:"disabled_at"`
+	QuotaBytes   int64          `json:"quota_bytes"`
+	FileCount    int64          `json:"file_count"`
+	TrashedCount int64          `json:"trashed_count"`
+	UsedBytes    int64          `json:"used_bytes"`
+}
+
+// The account-management list. File counts come from correlated subqueries
+// rather than a GROUP BY join so a user with no files still appears (with 0)
+// and the active/trashed split stays one row per user. used_bytes sums the
+// stored content_size column rather than measuring html_content, so listing
+// every account does not read every account's documents.
+func (q *Queries) ListUsersWithFileCounts(ctx context.Context) ([]ListUsersWithFileCountsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listUsersWithFileCounts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListUsersWithFileCountsRow
+	for rows.Next() {
+		var i ListUsersWithFileCountsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Username,
+			&i.Nickname,
+			&i.PasswordHash,
+			&i.ApiKey,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DisabledAt,
+			&i.QuotaBytes,
+			&i.FileCount,
+			&i.TrashedCount,
+			&i.UsedBytes,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const setUserAPIKey = `-- name: SetUserAPIKey :exec
@@ -128,7 +311,7 @@ const updateUserNickname = `-- name: UpdateUserNickname :one
 UPDATE users
 SET nickname = ?, updated_at = CURRENT_TIMESTAMP
 WHERE id = ?
-RETURNING id, username, nickname, password_hash, api_key, created_at, updated_at
+RETURNING id, username, nickname, password_hash, api_key, created_at, updated_at, disabled_at, quota_bytes
 `
 
 type UpdateUserNicknameParams struct {
@@ -147,11 +330,13 @@ func (q *Queries) UpdateUserNickname(ctx context.Context, arg UpdateUserNickname
 		&i.ApiKey,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DisabledAt,
+		&i.QuotaBytes,
 	)
 	return i, err
 }
 
-const updateUserPassword = `-- name: UpdateUserPassword :exec
+const updateUserPassword = `-- name: UpdateUserPassword :execrows
 UPDATE users
 SET password_hash = ?, updated_at = CURRENT_TIMESTAMP
 WHERE id = ?
@@ -162,7 +347,41 @@ type UpdateUserPasswordParams struct {
 	ID           int64  `json:"id"`
 }
 
-func (q *Queries) UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error {
-	_, err := q.db.ExecContext(ctx, updateUserPassword, arg.PasswordHash, arg.ID)
-	return err
+// :execrows so the admin reset path can tell "changed it" from "no such user";
+// the self-service path in settings.go already knows the user exists.
+func (q *Queries) UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, updateUserPassword, arg.PasswordHash, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const updateUserQuota = `-- name: UpdateUserQuota :one
+UPDATE users
+SET quota_bytes = ?1, updated_at = CURRENT_TIMESTAMP
+WHERE id = ?2
+RETURNING id, username, nickname, password_hash, api_key, created_at, updated_at, disabled_at, quota_bytes
+`
+
+type UpdateUserQuotaParams struct {
+	QuotaBytes int64 `json:"quota_bytes"`
+	ID         int64 `json:"id"`
+}
+
+func (q *Queries) UpdateUserQuota(ctx context.Context, arg UpdateUserQuotaParams) (User, error) {
+	row := q.db.QueryRowContext(ctx, updateUserQuota, arg.QuotaBytes, arg.ID)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Username,
+		&i.Nickname,
+		&i.PasswordHash,
+		&i.ApiKey,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DisabledAt,
+		&i.QuotaBytes,
+	)
+	return i, err
 }

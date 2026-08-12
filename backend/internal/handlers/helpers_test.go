@@ -115,37 +115,91 @@ func TestSlugPattern(t *testing.T) {
 	}
 }
 
-func TestContentSnippet(t *testing.T) {
-	// No match → empty.
-	if got := contentSnippet("hello world", "zzz"); got != "" {
-		t.Errorf("contentSnippet(no match) = %q, want empty", got)
+// sqlWindow reproduces, in Go, exactly what SearchUserFilesWithContent's
+// instr()/substr() pair extracts, so the cases below exercise
+// snippetFromWindow against the shape it really receives instead of a
+// convenient one. SQLite counts characters (not bytes) in both functions and
+// instr() is 1-based, which is what makes the CJK case below meaningful.
+// TestSearchReturnsContentSnippets in internal/server covers the SQL half for
+// real, against a live database.
+func sqlWindow(content, query string) (window string, matchPos, contentChars int64) {
+	full := []rune(content)
+	lowered := []rune(strings.ToLower(content))
+	needle := []rune(strings.ToLower(query))
+
+	pos := -1
+	for i := 0; i+len(needle) <= len(lowered); i++ {
+		if string(lowered[i:i+len(needle)]) == string(needle) {
+			pos = i
+			break
+		}
+	}
+	if pos < 0 {
+		return "", 0, int64(len(full))
 	}
 
-	// Short content: whole thing, no ellipses.
-	if got := contentSnippet("hello world", "WORLD"); got != "hello world" {
-		t.Errorf("contentSnippet(short) = %q", got)
+	matchPos = int64(pos + 1)
+	start := max(int64(1), matchPos-100)
+	end := min(int(start-1)+len(needle)+200, len(full))
+	return string(full[start-1 : end]), matchPos, int64(len(full))
+}
+
+func TestSnippetFromWindow(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		query   string
+		want    string
+	}{
+		{
+			name:    "no match is empty",
+			content: "hello world",
+			query:   "zzz",
+			want:    "",
+		},
+		{
+			name:    "short content comes back whole, without ellipses",
+			content: "hello world",
+			query:   "WORLD",
+			want:    "hello world",
+		},
+		{
+			name:    "long content keeps 100 runes of context on each side",
+			content: strings.Repeat("a", 500) + "NEEDLE" + strings.Repeat("b", 500),
+			query:   "needle",
+			want:    "…" + strings.Repeat("a", 100) + "NEEDLE" + strings.Repeat("b", 100) + "…",
+		},
+		{
+			name:    "context is counted in runes, not bytes",
+			content: strings.Repeat("汉", 300) + "目标" + strings.Repeat("字", 300),
+			query:   "目标",
+			want:    "…" + strings.Repeat("汉", 100) + "目标" + strings.Repeat("字", 100) + "…",
+		},
+		{
+			// The window SQL hands over is longer than we want here, because
+			// its fixed length was budgeted for 100 runes of lead-in that do
+			// not exist. The trailing context still has to come out at 100.
+			name:    "a match at the start has no leading ellipsis",
+			content: "NEEDLE" + strings.Repeat("x", 500),
+			query:   "needle",
+			want:    "NEEDLE" + strings.Repeat("x", 100) + "…",
+		},
+		{
+			name:    "a match at the end has no trailing ellipsis",
+			content: strings.Repeat("x", 500) + "NEEDLE",
+			query:   "needle",
+			want:    "…" + strings.Repeat("x", 100) + "NEEDLE",
+		},
 	}
 
-	// Long content: ±100 runes of context with ellipses on both sides.
-	long := strings.Repeat("a", 500) + "NEEDLE" + strings.Repeat("b", 500)
-	got := contentSnippet(long, "needle")
-	want := "…" + strings.Repeat("a", 100) + "NEEDLE" + strings.Repeat("b", 100) + "…"
-	if got != want {
-		t.Errorf("contentSnippet(long) = %q (len %d), want %q", got, len(got), want)
-	}
-
-	// Multi-byte runes: context is counted in runes and stays valid UTF-8.
-	cn := strings.Repeat("汉", 300) + "目标" + strings.Repeat("字", 300)
-	got = contentSnippet(cn, "目标")
-	want = "…" + strings.Repeat("汉", 100) + "目标" + strings.Repeat("字", 100) + "…"
-	if got != want {
-		t.Errorf("contentSnippet(cjk) = %q", got)
-	}
-
-	// Match at the very start: no leading ellipsis.
-	got = contentSnippet("NEEDLE"+strings.Repeat("x", 500), "needle")
-	if !strings.HasPrefix(got, "NEEDLE") || !strings.HasSuffix(got, "…") {
-		t.Errorf("contentSnippet(start) = %q", got)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			window, matchPos, contentChars := sqlWindow(c.content, c.query)
+			got := snippetFromWindow(window, c.query, matchPos, contentChars)
+			if got != c.want {
+				t.Errorf("snippetFromWindow() = %q, want %q", got, c.want)
+			}
+		})
 	}
 }
 
