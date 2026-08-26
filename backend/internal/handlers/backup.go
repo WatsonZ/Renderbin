@@ -38,12 +38,7 @@ func NewBackupHandler(db *sql.DB, logger *slog.Logger) *BackupHandler {
 // than 404 because this path is fixed and public (the SPA links to it) — only
 // the caller's privilege is in question, not the endpoint's existence.
 func (h *BackupHandler) Download(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireUser(w, r)
-	if !ok {
-		return
-	}
-	if !IsSuperAdmin(user) {
-		http.Error(w, "super admin only", http.StatusForbidden)
+	if _, ok := requireSuperAdmin(w, r); !ok {
 		return
 	}
 
@@ -103,12 +98,8 @@ type restoreResponse struct {
 // the response is still 200 with what was restored, and the client is expected
 // to reload and re-authenticate.
 func (h *BackupHandler) Restore(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireUser(w, r)
+	user, ok := requireSuperAdmin(w, r)
 	if !ok {
-		return
-	}
-	if !IsSuperAdmin(user) {
-		http.Error(w, "super admin only", http.StatusForbidden)
 		return
 	}
 

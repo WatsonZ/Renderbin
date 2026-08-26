@@ -110,12 +110,18 @@ func New(queries *sqlcgen.Queries, conn *sql.DB, logger *slog.Logger) http.Handl
 	return r
 }
 
-// requireAuth 401s any request without a valid session cookie, and resolves
-// the session to its user once so downstream handlers can read it from the
+// requireAuth 401s any request without a valid credential — a session cookie
+// or a Bearer API key (the same per-user key MCP uses, and under the same
+// rules: dead while mcp_enabled is off or the account is suspended) — and
+// resolves it to the user once so downstream handlers can read it from the
 // request context instead of each repeating the lookup. Every file query is
 // owner-scoped, so handlers need that identity anyway — resolving it here
 // makes "behind requireAuth implies a known user" a property of the router
 // rather than a convention each new handler has to remember.
+//
+// How the caller authenticated travels along in the context: super-admin
+// endpoints accept only sessions (see handlers.requireSuperAdmin), so an API
+// key stays a file-scope credential.
 //
 // The lookup and the context accessors live in internal/handlers so this
 // middleware and the routes outside it can share them without an import cycle
@@ -123,12 +129,12 @@ func New(queries *sqlcgen.Queries, conn *sql.DB, logger *slog.Logger) http.Handl
 func requireAuth(queries *sqlcgen.Queries) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			user, ok := handlers.CurrentUser(r, queries)
+			user, viaAPIKey, ok := handlers.CurrentIdentity(r, queries)
 			if !ok {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
-			next.ServeHTTP(w, handlers.WithUser(r, user))
+			next.ServeHTTP(w, handlers.WithIdentity(r, user, viaAPIKey))
 		})
 	}
 }

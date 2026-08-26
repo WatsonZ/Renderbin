@@ -42,6 +42,8 @@ claude mcp add --transport http renderbin https://your-host/mcp \
 
 工具全部只作用于 Key 属主自己的文件:`upload_file`、`upload_files`(最多 20 个)、`list_files`、`search_files`、`update_file`、`publish_file`(可附带 `ttl` 或 `max_views` 限制)、`unpublish_file`、`delete_file`(两段式确认,仅移入回收站)。
 
+同一个 Key 也可以作为 Bearer Token 直接调用 REST API(如 `curl -H "Authorization: Bearer rb_..." https://your-host/api/files`),规则与 MCP 一致:随 MCP 开关一同生效、账号停用即失效,且始终只是文件级凭据——备份、账号管理等超管接口仍要求浏览器登录的会话。
+
 ## 技术栈
 
 一个进程、一个数据库文件,不依赖任何外部服务:
@@ -116,6 +118,8 @@ claude mcp add --transport http renderbin https://your-host/mcp \
 ```
 
 Tools, all scoped to the key owner's own files: `upload_file`, `upload_files` (up to 20), `list_files`, `search_files`, `update_file`, `publish_file` (optionally with a `ttl` or `max_views` limit), `unpublish_file`, `delete_file` (two-step confirm, trash only).
+
+The same key also works as a Bearer token against the REST API (e.g. `curl -H "Authorization: Bearer rb_..." https://your-host/api/files`), under the same rules as MCP: it lives and dies with the MCP toggle and the account's status, and it stays a file-scope credential — super-admin endpoints (backup, account management) still require a browser-login session.
 
 ## Tech stack
 

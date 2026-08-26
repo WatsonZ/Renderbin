@@ -41,12 +41,7 @@ type updateSettingsRequest struct {
 // Update writes global configs; super admin only. Fields are optional so the
 // frontend can toggle one switch without resending the other.
 func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireUser(w, r)
-	if !ok {
-		return
-	}
-	if !IsSuperAdmin(user) {
-		http.Error(w, "super admin only", http.StatusForbidden)
+	if _, ok := requireSuperAdmin(w, r); !ok {
 		return
 	}
 

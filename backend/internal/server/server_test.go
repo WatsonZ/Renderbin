@@ -2484,3 +2484,156 @@ func TestRenderIgnoresForeignSession(t *testing.T) {
 			after.SuccessCount, after.CodeSuccessCount)
 	}
 }
+
+// --- API-key REST access ---
+
+// apiKeyFor turns on mcp_enabled and issues an API key for userID — the only
+// state the real settings flow can produce a key in.
+func (e *testEnv) apiKeyFor(t *testing.T, userID int64) string {
+	t.Helper()
+	if err := e.queries.SetConfig(context.Background(), sqlcgen.SetConfigParams{
+		Key: "mcp_enabled", Value: "true",
+	}); err != nil {
+		t.Fatalf("SetConfig(mcp_enabled): %v", err)
+	}
+	key, err := auth.NewAPIKey()
+	if err != nil {
+		t.Fatalf("NewAPIKey: %v", err)
+	}
+	if err := e.queries.SetUserAPIKey(context.Background(), sqlcgen.SetUserAPIKeyParams{
+		ApiKey: sql.NullString{String: key, Valid: true},
+		ID:     userID,
+	}); err != nil {
+		t.Fatalf("SetUserAPIKey: %v", err)
+	}
+	return key
+}
+
+// doKey is do with a Bearer API key instead of a session cookie.
+func (e *testEnv) doKey(t *testing.T, method, path, body, key string) *http.Response {
+	t.Helper()
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, e.srv.URL+path, r)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := e.srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	return resp
+}
+
+func TestAPIKeyRESTAccess(t *testing.T) {
+	e := newEnv(t)
+	user, _ := e.newUser(t, "bob")
+	key := e.apiKeyFor(t, user.ID)
+
+	// Create, then read back, through the key alone.
+	resp := e.doKey(t, http.MethodPost, "/api/files",
+		`{"name":"via key","html_content":"<p>hi</p>"}`, key)
+	assertStatus(t, resp, http.StatusCreated)
+	created := decodeFile(t, resp)
+
+	resp = e.doKey(t, http.MethodGet, "/api/files/"+created.Slug, "", key)
+	assertStatus(t, resp, http.StatusOK)
+	if got := decodeFile(t, resp); got.HTMLContent != "<p>hi</p>" {
+		t.Errorf("content = %q, want the uploaded source", got.HTMLContent)
+	}
+
+	// The key resolves to its owner, not to whoever happens to be user 1.
+	resp = e.doKey(t, http.MethodGet, "/api/auth/me", "", key)
+	assertStatus(t, resp, http.StatusOK)
+	if body := bodyString(t, resp); !strings.Contains(body, `"bob"`) {
+		t.Errorf("me = %s, want username bob", body)
+	}
+
+	// Owner scoping is unchanged: bob's key can't see the admin's file.
+	adminFile := e.createViaAPI(t, e.authCookie(t), "admins", "<p>secret</p>")
+	resp = e.doKey(t, http.MethodGet, "/api/files/"+adminFile.Slug, "", key)
+	assertStatus(t, resp, http.StatusNotFound)
+	bodyString(t, resp)
+
+	// A key that matches no row is a plain 401.
+	resp = e.doKey(t, http.MethodGet, "/api/files", "", "rb_nope")
+	assertStatus(t, resp, http.StatusUnauthorized)
+	bodyString(t, resp)
+}
+
+// TestAPIKeyRESTGates pins the two kill switches: the mcp_enabled config and
+// account suspension both make every key dead on its next request.
+func TestAPIKeyRESTGates(t *testing.T) {
+	e := newEnv(t)
+	user, _ := e.newUser(t, "carol")
+	key := e.apiKeyFor(t, user.ID)
+
+	resp := e.doKey(t, http.MethodGet, "/api/files", "", key)
+	assertStatus(t, resp, http.StatusOK)
+	bodyString(t, resp)
+
+	if err := e.queries.SetConfig(context.Background(), sqlcgen.SetConfigParams{
+		Key: "mcp_enabled", Value: "false",
+	}); err != nil {
+		t.Fatalf("SetConfig: %v", err)
+	}
+	resp = e.doKey(t, http.MethodGet, "/api/files", "", key)
+	assertStatus(t, resp, http.StatusUnauthorized)
+	bodyString(t, resp)
+
+	if err := e.queries.SetConfig(context.Background(), sqlcgen.SetConfigParams{
+		Key: "mcp_enabled", Value: "true",
+	}); err != nil {
+		t.Fatalf("SetConfig: %v", err)
+	}
+	if _, err := e.queries.DisableUser(context.Background(), user.ID); err != nil {
+		t.Fatalf("DisableUser: %v", err)
+	}
+	resp = e.doKey(t, http.MethodGet, "/api/files", "", key)
+	assertStatus(t, resp, http.StatusUnauthorized)
+	bodyString(t, resp)
+}
+
+// TestAPIKeyCannotUseSuperAdminEndpoints pins the escalation boundary: even
+// the super admin's own key must not unlock the surfaces that expose other
+// accounts' data. api_key is stored in plaintext on the accepted premise that
+// a key can never reach /api/backup; a key that could would carry every hash
+// and every other key out in one request.
+func TestAPIKeyCannotUseSuperAdminEndpoints(t *testing.T) {
+	e := newEnv(t)
+	adminKey := e.apiKeyFor(t, e.admin.ID)
+
+	for _, tc := range []struct {
+		method, path, body string
+	}{
+		{http.MethodGet, "/api/backup", ""},
+		{http.MethodPost, "/api/backup/restore", "not-a-db"},
+		{http.MethodPut, "/api/settings", `{"allow_registration":true}`},
+		{http.MethodGet, "/api/admin/users", ""},
+		{http.MethodPost, "/api/admin/users", `{"username":"eve"}`},
+	} {
+		resp := e.doKey(t, tc.method, tc.path, tc.body, adminKey)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s %s with admin key: status = %d, want 403", tc.method, tc.path, resp.StatusCode)
+		}
+		bodyString(t, resp)
+	}
+
+	// The same requests keep working over the admin's session.
+	resp := e.do(t, http.MethodGet, "/api/admin/users", "", e.authCookie(t))
+	assertStatus(t, resp, http.StatusOK)
+	bodyString(t, resp)
+
+	// A non-admin key fails the role check before the auth-method check.
+	user, _ := e.newUser(t, "dave")
+	userKey := e.apiKeyFor(t, user.ID)
+	resp = e.doKey(t, http.MethodGet, "/api/backup", "", userKey)
+	assertStatus(t, resp, http.StatusForbidden)
+	bodyString(t, resp)
+}

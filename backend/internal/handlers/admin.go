@@ -37,21 +37,6 @@ func NewAdminHandler(queries *sqlcgen.Queries, conn *sql.DB, logger *slog.Logger
 	return &AdminHandler{queries: queries, conn: conn, logger: logger}
 }
 
-// requireSuperAdmin is the preamble for every handler in this file. 403 rather
-// than 404: these paths are fixed and the SPA links to them, so only the
-// caller's privilege is in question, not the endpoint's existence.
-func (h *AdminHandler) requireSuperAdmin(w http.ResponseWriter, r *http.Request) (sqlcgen.User, bool) {
-	user, ok := requireUser(w, r)
-	if !ok {
-		return sqlcgen.User{}, false
-	}
-	if !IsSuperAdmin(user) {
-		http.Error(w, "super admin only", http.StatusForbidden)
-		return sqlcgen.User{}, false
-	}
-	return user, true
-}
-
 type adminUserResponse struct {
 	ID           int64   `json:"id"`
 	Username     string  `json:"username"`
@@ -71,7 +56,7 @@ type adminUserResponse struct {
 // of the response: the page has no use for them, and the whole-database backup
 // is already the one place that exposes them.
 func (h *AdminHandler) List(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requireSuperAdmin(w, r); !ok {
+	if _, ok := requireSuperAdmin(w, r); !ok {
 		return
 	}
 
@@ -130,7 +115,7 @@ type setUserStatusRequest struct {
 // suspension, so allowing it would be a one-way door out of the app with no
 // path back that doesn't involve editing the database by hand.
 func (h *AdminHandler) SetStatus(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requireSuperAdmin(w, r); !ok {
+	if _, ok := requireSuperAdmin(w, r); !ok {
 		return
 	}
 	id, ok := targetUserID(w, r)
@@ -200,7 +185,7 @@ type resetUserPasswordRequest struct {
 // move a script running in the super admin's browser wants: one POST both takes
 // the account and locks its owner out, with the CLI as the only way back.
 func (h *AdminHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
-	caller, ok := h.requireSuperAdmin(w, r)
+	caller, ok := requireSuperAdmin(w, r)
 	if !ok {
 		return
 	}
@@ -275,7 +260,7 @@ type createUserResponse struct {
 // person for another tends to be weak, reused, or both, and the recipient can
 // change it from their own profile page once they are in.
 func (h *AdminHandler) Create(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requireSuperAdmin(w, r); !ok {
+	if _, ok := requireSuperAdmin(w, r); !ok {
 		return
 	}
 
@@ -337,7 +322,7 @@ type deleteUserResponse struct {
 // accounts, so deleting it is a one-way door out of the app) and the caller's
 // own, which is the same door reached from the other side.
 func (h *AdminHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	caller, ok := h.requireSuperAdmin(w, r)
+	caller, ok := requireSuperAdmin(w, r)
 	if !ok {
 		return
 	}
@@ -411,7 +396,7 @@ const maxQuotaBytes = 1 << 40 // 1 TiB
 // deleting someone's data to satisfy a new limit is not a decision this
 // endpoint gets to make.
 func (h *AdminHandler) SetQuota(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requireSuperAdmin(w, r); !ok {
+	if _, ok := requireSuperAdmin(w, r); !ok {
 		return
 	}
 	id, ok := targetUserID(w, r)
