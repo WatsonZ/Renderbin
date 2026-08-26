@@ -22,20 +22,23 @@ func NewSettingsHandler(queries *sqlcgen.Queries, logger *slog.Logger) *Settings
 }
 
 type settingsResponse struct {
-	AllowRegistration bool `json:"allow_registration"`
-	MCPEnabled        bool `json:"mcp_enabled"`
+	AllowRegistration   bool `json:"allow_registration"`
+	MCPEnabled          bool `json:"mcp_enabled"`
+	UploadDefaultPublic bool `json:"upload_default_public"`
 }
 
 func (h *SettingsHandler) Get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, settingsResponse{
-		AllowRegistration: configBool(r, h.queries, ConfigAllowRegistration),
-		MCPEnabled:        configBool(r, h.queries, ConfigMCPEnabled),
+		AllowRegistration:   configBool(r, h.queries, ConfigAllowRegistration),
+		MCPEnabled:          configBool(r, h.queries, ConfigMCPEnabled),
+		UploadDefaultPublic: configBool(r, h.queries, ConfigUploadDefaultPublic),
 	})
 }
 
 type updateSettingsRequest struct {
-	AllowRegistration *bool `json:"allow_registration"`
-	MCPEnabled        *bool `json:"mcp_enabled"`
+	AllowRegistration   *bool `json:"allow_registration"`
+	MCPEnabled          *bool `json:"mcp_enabled"`
+	UploadDefaultPublic *bool `json:"upload_default_public"`
 }
 
 // Update writes global configs; super admin only. Fields are optional so the
@@ -51,8 +54,9 @@ func (h *SettingsHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	updates := map[string]*bool{
-		ConfigAllowRegistration: req.AllowRegistration,
-		ConfigMCPEnabled:        req.MCPEnabled,
+		ConfigAllowRegistration:   req.AllowRegistration,
+		ConfigMCPEnabled:          req.MCPEnabled,
+		ConfigUploadDefaultPublic: req.UploadDefaultPublic,
 	}
 	for key, value := range updates {
 		if value == nil {

@@ -222,6 +222,9 @@ export const en = {
 	'config.enableMcp': 'Enable MCP',
 	'config.enableMcpHint':
 		'Lets AI clients manage your files over MCP: each user gets an API key, used as a Bearer token against the /mcp endpoint.',
+	'config.uploadDefaultPublic': 'New files start public',
+	'config.uploadDefaultPublicHint':
+		'Files created on the dashboard or over the API start public, viewable by anyone with the link and access code. When off, every new file starts private. MCP uploads always start private.',
 
 	// Settings page
 	'settings.title': 'Settings',
@@ -235,6 +238,7 @@ export const en = {
 	'settings.newPassword': 'New password',
 	'settings.passwordUpdated': 'Password updated.',
 	'settings.registration': 'Registration',
+	'settings.uploads': 'Uploads',
 	'backup.title': 'Backup & restore',
 	'backup.download': 'Download a backup',
 	'backup.downloadHint':
@@ -557,6 +561,9 @@ export const zh = {
 	'config.enableMcp': '启用 MCP',
 	'config.enableMcpHint':
 		'允许 AI 客户端通过 MCP 管理你的文件：每个用户会获得一个 API Key，作为 Bearer Token 连接 /mcp 端点。',
+	'config.uploadDefaultPublic': '新文件默认公开',
+	'config.uploadDefaultPublicHint':
+		'在仪表盘或通过 API 创建的文件默认公开，任何拿到链接和访问码的人都能立即查看；关闭时新文件默认私有。MCP 上传始终以私有创建。',
 
 	// Settings page
 	'settings.title': '设置',
@@ -570,6 +577,7 @@ export const zh = {
 	'settings.newPassword': '新密码',
 	'settings.passwordUpdated': '密码已更新。',
 	'settings.registration': '注册',
+	'settings.uploads': '上传',
 	'backup.title': '备份与恢复',
 	'backup.download': '下载备份',
 	'backup.downloadHint': '一个 SQLite 文件，包含全部内容：所有账号及其所有文件。',

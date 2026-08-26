@@ -249,9 +249,12 @@ func (m *MCPHandler) createUpload(ctx context.Context, user sqlcgen.User, in mcp
 		Name:        name,
 		HtmlContent: in.Content,
 		Kind:        kind,
-		IsPublic:    false, // uploads start private; publish_file makes them public
-		AccessCode:  accessCode,
-		UserID:      user.ID,
+		// Always private, regardless of ConfigUploadDefaultPublic: the upload
+		// tools promise "starts private" in their descriptions, and publish_file
+		// is the agent's explicit consent step for making anything reachable.
+		IsPublic:   false,
+		AccessCode: accessCode,
+		UserID:     user.ID,
 	})
 	if err != nil {
 		m.logger.Error("mcp create file", "error", err)

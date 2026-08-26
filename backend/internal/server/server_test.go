@@ -2637,3 +2637,36 @@ func TestAPIKeyCannotUseSuperAdminEndpoints(t *testing.T) {
 	assertStatus(t, resp, http.StatusForbidden)
 	bodyString(t, resp)
 }
+
+// TestUploadDefaultVisibilityConfig pins the upload_default_public config: off
+// (or absent) means files are created private; on means the HTTP create path
+// starts them public — while MCP uploads stay private either way, because the
+// upload tools promise that and publish_file is the explicit consent step.
+func TestUploadDefaultVisibilityConfig(t *testing.T) {
+	e := newEnv(t)
+	cookie := e.authCookie(t)
+
+	if f := e.createViaAPI(t, cookie, "before", "<p>a</p>"); f.IsPublic {
+		t.Error("with the config absent, a new file is public, want private")
+	}
+
+	resp := e.do(t, http.MethodPut, "/api/settings", `{"upload_default_public":true}`, cookie)
+	assertStatus(t, resp, http.StatusOK)
+	if body := bodyString(t, resp); !strings.Contains(body, `"upload_default_public":true`) {
+		t.Errorf("settings after update = %s, want upload_default_public true", body)
+	}
+
+	f := e.createViaAPI(t, cookie, "after", "<p>b</p>")
+	if !f.IsPublic {
+		t.Error("with the config on, a new file is private, want public")
+	}
+	// And the link works anonymously right away.
+	resp = e.do(t, http.MethodGet, "/res/"+f.Slug+"?code="+f.AccessCode, "", nil)
+	assertStatus(t, resp, http.StatusOK)
+	bodyString(t, resp)
+
+	key := e.apiKeyFor(t, e.admin.ID)
+	if out := e.mcpUpload(t, key, "agent-doc", "markdown", "# hi"); out["is_public"] != false {
+		t.Errorf("MCP upload with the config on: is_public = %v, want false", out["is_public"])
+	}
+}

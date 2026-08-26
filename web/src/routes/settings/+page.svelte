@@ -39,6 +39,8 @@
 	// svelte-ignore state_referenced_locally
 	let mcpEnabled = $state(data.settings.mcp_enabled);
 	// svelte-ignore state_referenced_locally
+	let uploadDefaultPublic = $state(data.settings.upload_default_public);
+	// svelte-ignore state_referenced_locally
 	let apiKey = $state<string | null>(data.apiKey);
 	let configError = $state<string | null>(null);
 	let apiKeyCopied = $state(false);
@@ -121,6 +123,16 @@
 		try {
 			const next = await updateSettings({ allow_registration: !allowRegistration });
 			allowRegistration = next.allow_registration;
+		} catch {
+			configError = t('error.updateSettings');
+		}
+	}
+
+	async function toggleUploadDefaultPublic() {
+		configError = null;
+		try {
+			const next = await updateSettings({ upload_default_public: !uploadDefaultPublic });
+			uploadDefaultPublic = next.upload_default_public;
 		} catch {
 			configError = t('error.updateSettings');
 		}
@@ -307,6 +319,32 @@
 					disabled={!isAdmin}
 					label={t('config.allowRegistration')}
 					onToggle={toggleRegistration}
+				/>
+			</div>
+		</section>
+
+		<!-- Section: uploads -->
+		<section class="rounded-2xl border border-neutral-800 bg-neutral-900/60 p-6">
+			<h2 class="flex items-center gap-2 text-base font-semibold">
+				<Icon icon="lucide:upload" width="17" height="17" class="text-emerald-400" />
+				{t('settings.uploads')}
+			</h2>
+
+			<div class="mt-5 flex items-start justify-between gap-4">
+				<div>
+					<p class="text-sm text-neutral-200">{t('config.uploadDefaultPublic')}</p>
+					<p class="mt-0.5 text-xs text-neutral-500">
+						{t('config.uploadDefaultPublicHint')}
+						{#if !isAdmin}
+							{t('settings.adminOnly')}
+						{/if}
+					</p>
+				</div>
+				<Toggle
+					checked={uploadDefaultPublic}
+					disabled={!isAdmin}
+					label={t('config.uploadDefaultPublic')}
+					onToggle={toggleUploadDefaultPublic}
 				/>
 			</div>
 		</section>

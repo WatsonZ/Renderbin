@@ -522,9 +522,12 @@ func (h *FilesHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Name:        req.Name,
 		HtmlContent: req.HTMLContent,
 		Kind:        kind,
-		IsPublic:    false,
-		AccessCode:  accessCode,
-		UserID:      user.ID,
+		// The instance-wide default visibility. Deliberately not a request
+		// field: visibility changes are their own endpoint, and a per-request
+		// override here would let one protocol bypass the policy the admin set.
+		IsPublic:   configBool(r, h.queries, ConfigUploadDefaultPublic),
+		AccessCode: accessCode,
+		UserID:     user.ID,
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {

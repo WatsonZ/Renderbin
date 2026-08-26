@@ -20,6 +20,12 @@ import (
 const (
 	ConfigAllowRegistration = "allow_registration"
 	ConfigMCPEnabled        = "mcp_enabled"
+	// ConfigUploadDefaultPublic makes files created over HTTP start public.
+	// Missing (the default) means private — the fail-closed direction for a
+	// setting that decides whether a link works before its owner ever looked
+	// at it. MCP uploads ignore it: those tools promise "starts private" in
+	// their descriptions, and publish_file is the agent's explicit consent step.
+	ConfigUploadDefaultPublic = "upload_default_public"
 )
 
 // configBool reads a boolean config; missing keys and read errors are false.

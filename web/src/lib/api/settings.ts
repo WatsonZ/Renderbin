@@ -3,6 +3,7 @@ import { AuthApiError } from './auth';
 export interface Settings {
 	allow_registration: boolean;
 	mcp_enabled: boolean;
+	upload_default_public: boolean;
 }
 
 export async function getSettings(fetchFn: typeof fetch = fetch): Promise<Settings> {
